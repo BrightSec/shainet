@@ -31,7 +31,7 @@ Add to your `shard.yml`:
 ```yaml
 dependencies:
   shainet:
-    github: NeuraLegion/shainet
+    github: BrightSec/shainet
 ```
 
 ### GPU Acceleration (Optional)
@@ -54,7 +54,7 @@ puts "CUDA version: #{SHAInet::CUDA.version || "unknown"}"
 For best performance (especially with transformers):
 
 ```bash
-git clone https://github.com/NeuraLegion/shainet.git
+git clone https://github.com/BrightSec/shainet.git
 cd shainet
 make install
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(pwd)
@@ -308,7 +308,7 @@ out[0, 0].as(SHAInet::Autograd::Tensor).backward
 
 ## Contributing
 
-1. Fork [https://github.com/NeuraLegion/shainet](https://github.com/NeuraLegion/shainet)
+1. Fork [https://github.com/BrightSec/shainet](https://github.com/BrightSec/shainet)
 2. Create a feature branch
 3. Commit and push your changes
 4. Open a Pull Request
