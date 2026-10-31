@@ -1683,6 +1683,191 @@ int attention_split_ws_floats(int new_tokens, int num_heads, int head_dim, int t
 // extern "C++" because a template cannot carry C linkage, and this sits inside the file's extern "C"
 // block alongside the two exported entry points that instantiate it.
 extern "C++" {
+
+// ---------------------------------------------------------------------------------------------
+// Single-token decode attention, grouped by KV head.
+//
+// attention_split_kv_kernel runs a block per (query head, split): every one of the 6 query heads that
+// share a KV head re-reads that head's keys and values, and each thread walks one key row a byte at a
+// time with a 256-byte stride between neighbouring threads. At 55K tokens of context that made decode
+// 111 ms per token against 58 ms at 3.5K, where reading the whole fp8 cache once costs ~5 ms.
+//
+// Here a block owns one KV head and one 512-key split and serves ALL its query heads: K and V are read
+// once, coalesced. Scores: a warp per key, each lane 8 dims (one 8-byte fp8 / 16-byte fp16 load) with
+// the query heads' matching dims in registers, reduced by shuffles. Softmax statistics: a warp per
+// head over the split. P*V: each thread owns output dims. The partials land in exactly the layout of
+// attention_split_kv_kernel, so attention_split_combine_kernel and the workspace sizing are shared.
+#define DGQA_MAX_HPK 8
+#define DGQA_THREADS 256
+
+__device__ __forceinline__ void kv_load8f(const __half* p, float* f) {
+    const uint4 u = *((const uint4*)p);
+    const __half2* h = (const __half2*)&u;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 t = __half22float2(h[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+__device__ __forceinline__ void kv_load8f(const __nv_fp8_e4m3* p, float* f) {
+    const uint2 raw = *((const uint2*)p);
+    const unsigned int w[2] = {raw.x, raw.y};
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(
+            (__nv_fp8x2_storage_t)((w[i >> 1] >> (16 * (i & 1))) & 0xFFFF), __NV_E4M3);
+        const float2 t = __half22float2(*((const __half2*)&hr));
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+template <typename KV, int D>
+__global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
+    const float* __restrict__ q, const KV* __restrict__ kc, const KV* __restrict__ vc,
+    float* __restrict__ part_out, float* __restrict__ part_max, float* __restrict__ part_sum,
+    int start_pos, int num_heads, int hpk, int capacity, float scale, int num_splits) {
+    __shared__ float sc[DGQA_MAX_HPK][ATTN_SPLIT_SCORES];
+    __shared__ float red[DGQA_THREADS / D][DGQA_MAX_HPK][D];
+    const int kvh = blockIdx.x, sp = blockIdx.y;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int visible = start_pos + 1;
+    const int j0 = sp * ATTN_SPLIT_SCORES;
+    const int j1 = min(j0 + ATTN_SPLIT_SCORES, visible);
+    const int h0 = kvh * hpk;
+    const KV* kh = kc + (long)kvh * capacity * D;
+    const KV* vh = vc + (long)kvh * capacity * D;
+
+    if (j0 >= j1) {   // empty split: the combine's identity (max -inf, sum 0, zero partial)
+        for (int i = tid; i < hpk * D; i += DGQA_THREADS) {
+            const int hl = i / D, d = i - hl * D;
+            const long pidx = (long)(h0 + hl) * num_splits + sp;
+            part_out[pidx * D + d] = 0.0f;
+            if (d == 0) { part_max[pidx] = -INFINITY; part_sum[pidx] = 0.0f; }
+        }
+        return;
+    }
+
+    // Scores. Lane owns dims [lane*8, lane*8+8) for D=256, [lane*4, ...) pairs for D=128 (handled by
+    // giving each lane D/32 dims through 8-wide loads over half the lanes' worth of rows).
+    constexpr int DPL = D / 32;                 // dims per lane: 8 (D=256) or 4 (D=128)
+    float qr[DGQA_MAX_HPK][DPL];
+    #pragma unroll
+    for (int hl = 0; hl < DGQA_MAX_HPK; ++hl)
+        #pragma unroll
+        for (int e = 0; e < DPL; ++e)
+            qr[hl][e] = (hl < hpk) ? q[(long)(h0 + hl) * D + lane * DPL + e] : 0.0f;
+
+    for (int j = j0 + warp; j < j1; j += DGQA_THREADS / 32) {
+        float kf[8];
+        if (DPL == 8) {
+            kv_load8f(kh + (long)j * D + lane * 8, kf);
+        } else {
+            #pragma unroll
+            for (int e = 0; e < DPL; ++e) kf[e] = KVStore<KV>::load(kh, (long)j * D + lane * DPL + e);
+        }
+        float s[DGQA_MAX_HPK];
+        #pragma unroll
+        for (int hl = 0; hl < DGQA_MAX_HPK; ++hl) {
+            float a = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < DPL; ++e) a += qr[hl][e] * kf[e];
+            s[hl] = a;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            #pragma unroll
+            for (int hl = 0; hl < DGQA_MAX_HPK; ++hl) s[hl] += __shfl_xor_sync(0xFFFFFFFF, s[hl], o);
+        if (lane == 0)
+            #pragma unroll
+            for (int hl = 0; hl < DGQA_MAX_HPK; ++hl)
+                if (hl < hpk) sc[hl][j - j0] = s[hl] * scale;
+    }
+    __syncthreads();
+
+    // Per-head max and sum over the split; p written back in place.
+    const int nk = j1 - j0;
+    for (int hl = warp; hl < hpk; hl += DGQA_THREADS / 32) {
+        float m = -INFINITY;
+        for (int i = lane; i < nk; i += 32) m = fmaxf(m, sc[hl][i]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFF, m, o));
+        float sum = 0.0f;
+        for (int i = lane; i < nk; i += 32) {
+            const float e = expf(sc[hl][i] - m);
+            sc[hl][i] = e;
+            sum += e;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xFFFFFFFF, sum, o);
+        if (lane == 0) {
+            const long pidx = (long)(h0 + hl) * num_splits + sp;
+            part_max[pidx] = m;
+            part_sum[pidx] = sum;
+        }
+    }
+    __syncthreads();
+
+    // P*V: thread owns dim d; with D=128 two thread groups split the keys and are summed after.
+    constexpr int G = DGQA_THREADS / D;
+    const int d = tid % D, grp = tid / D;
+    float acc[DGQA_MAX_HPK];
+    #pragma unroll
+    for (int hl = 0; hl < DGQA_MAX_HPK; ++hl) acc[hl] = 0.0f;
+    #pragma unroll 4
+    for (int i = grp; i < nk; i += G) {
+        const float v = KVStore<KV>::load(vh, (long)(j0 + i) * D + d);
+        #pragma unroll
+        for (int hl = 0; hl < DGQA_MAX_HPK; ++hl)
+            if (hl < hpk) acc[hl] += sc[hl][i] * v;
+    }
+    if (G > 1) {
+        #pragma unroll
+        for (int hl = 0; hl < DGQA_MAX_HPK; ++hl) red[grp][hl][d] = acc[hl];
+        __syncthreads();
+        if (grp == 0)
+            #pragma unroll
+            for (int hl = 0; hl < DGQA_MAX_HPK; ++hl)
+                for (int g2 = 1; g2 < G; ++g2) acc[hl] += red[g2][hl][d];
+    }
+    if (grp == 0)
+        for (int hl = 0; hl < hpk; ++hl)
+            part_out[((long)(h0 + hl) * num_splits + sp) * D + d] = acc[hl];
+}
+
+// 1 when the grouped kernel took the call (one token, head_dim 128/256, at most 8 query heads per KV
+// head, a half or fp8 cache); 0 leaves it to attention_split_kv_kernel.
+template <typename KV>
+static int attention_decode_gqa_launch(const float* q, const KV* kc, const KV* vc,
+                                       float* part_out, float* part_max, float* part_sum,
+                                       int start_pos, int num_heads, int heads_per_kv, int head_dim,
+                                       int capacity, float scale, int splits) {
+    static const bool enabled = [] {
+        const char* e = getenv("SHAINET_DECODE_GQA_ATTN");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || heads_per_kv > DGQA_MAX_HPK || num_heads % heads_per_kv != 0) return 0;
+    dim3 grid(num_heads / heads_per_kv, splits);
+    switch (head_dim) {
+    case 256:
+        attention_decode_gqa_kernel<KV, 256><<<grid, DGQA_THREADS>>>(q, kc, vc, part_out, part_max, part_sum,
+            start_pos, num_heads, heads_per_kv, capacity, scale, splits);
+        return 1;
+    case 128:
+        attention_decode_gqa_kernel<KV, 128><<<grid, DGQA_THREADS>>>(q, kc, vc, part_out, part_max, part_sum,
+            start_pos, num_heads, heads_per_kv, capacity, scale, splits);
+        return 1;
+    default:
+        return 0;
+    }
+}
+template <>
+int attention_decode_gqa_launch<float>(const float*, const float*, const float*, float*, float*, float*,
+                                       int, int, int, int, int, float, int) {
+    return 0;   // the f32 cache keeps the per-head kernel
+}
+
 template <typename KV>
 static void attention_split_kv_launch(const float* q, const KV* kc, const KV* vc,
                                       float* out, float* ws, int new_tokens, int start_pos,
@@ -1698,13 +1883,18 @@ static void attention_split_kv_launch(const float* q, const KV* kc, const KV* vc
     float* part_sum = part_max + n_part;
 
     const int threads = 128;
-    dim3 grid(num_heads, new_tokens, splits);
-    size_t shmem = (head_dim + ATTN_SPLIT_SCORES + threads) * sizeof(float);
-    attention_split_kv_kernel<KV><<<grid, threads, shmem>>>(q, kc, vc,
-                                                            part_out, part_max, part_sum,
-                                                            new_tokens, start_pos, num_heads,
-                                                            heads_per_kv, head_dim, capacity,
-                                                            scale, splits);
+    const bool grouped = new_tokens == 1 &&
+        attention_decode_gqa_launch<KV>(q, kc, vc, part_out, part_max, part_sum, start_pos, num_heads,
+                                        heads_per_kv, head_dim, capacity, scale, splits);
+    if (!grouped) {
+        dim3 grid(num_heads, new_tokens, splits);
+        size_t shmem = (head_dim + ATTN_SPLIT_SCORES + threads) * sizeof(float);
+        attention_split_kv_kernel<KV><<<grid, threads, shmem>>>(q, kc, vc,
+                                                                part_out, part_max, part_sum,
+                                                                new_tokens, start_pos, num_heads,
+                                                                heads_per_kv, head_dim, capacity,
+                                                                scale, splits);
+    }
     dim3 cgrid(num_heads, new_tokens);
     attention_split_combine_kernel<<<cgrid, threads>>>(part_out, part_max, part_sum, out,
                                                        new_tokens, num_heads, head_dim, splits);
@@ -4357,12 +4547,11 @@ int mmq_decode_rows(int ggml_type, const unsigned char* w, signed char* wq, floa
     }
 }
 
-// y[m, n] for `rows` weight rows into columns starting at y (leading dimension ldy). `offset` adds the
-// per-block weight offsets (Q4_K). Returns 0 when the shared-memory opt-in was refused.
-int mmq_gemm(int offset, const signed char* xq, const float* xs, const float* xsum,
-             const signed char* wq, const float* ws, const float* wo, float* y,
-             int M, int rows, int K, int ldy) {
-    constexpr int BM = 128, BN = 128, WM_ = 2, WN_ = 4, ST = 2;
+extern "C++" {
+template <int BM, int BN, int WM_, int WN_, int ST>
+static int mmq_gemm_launch(int offset, const signed char* xq, const float* xs, const float* xsum,
+                           const signed char* wq, const float* ws, const float* wo, float* y,
+                           int M, int rows, int K, int ldy) {
     static int ready = 0;
     const size_t smem = mmq2_smem_bytes<BM, BN, ST>();
     if (ready == 0) {
@@ -4386,5 +4575,25 @@ int mmq_gemm(int offset, const signed char* xq, const float* xs, const float* xs
         return 0;
     }
     return 1;
+}
+} // extern "C++"
+
+// y[m, n] for `rows` weight rows into columns starting at y (leading dimension ldy). `offset` adds the
+// per-block weight offsets (Q4_K). Returns 0 when the shared-memory opt-in was refused.
+int mmq_gemm(int offset, const signed char* xq, const float* xs, const float* xsum,
+             const signed char* wq, const float* ws, const float* wo, float* y,
+             int M, int rows, int K, int ldy) {
+    static int tile = -1;
+    if (tile < 0) {
+        const char* e = getenv("SHAINET_MMQ_TILE");
+        tile = e ? atoi(e) : 0;
+    }
+    switch (tile) {
+    case 1: return mmq_gemm_launch<64, 128, 2, 4, 3>(offset, xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
+    case 2: return mmq_gemm_launch<64, 64, 2, 2, 3>(offset, xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
+    case 3: return mmq_gemm_launch<128, 64, 4, 2, 3>(offset, xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
+    case 4: return mmq_gemm_launch<64, 128, 1, 4, 3>(offset, xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
+    default: return mmq_gemm_launch<128, 128, 2, 4, 2>(offset, xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
+    }
 }
 } // extern "C"
