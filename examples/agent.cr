@@ -1102,6 +1102,11 @@ module AgentDemo
                             context : Int32, regex : Bool) : String?
     rel = relativize(root)
     args = ["grep", "-nI", "--no-color", "--untracked", "-i"]
+    # An explicit path is a request to look THERE, so ignored files under it count. Without this a
+    # gitignored file named directly came back "No matches." -- git grep exits 1 for it -- which the
+    # model read as the tool ignoring its path (seen with a *.log-ignored run.log). Workspace-wide
+    # searches keep .gitignore so build output does not drown the real hits.
+    args << "--no-exclude-standard" unless rel == "." || rel.empty?
     args += ["-C", context.to_s] if context > 0
     args << (regex ? "-E" : "-F")
     args += ["-e", pattern, "--"]
