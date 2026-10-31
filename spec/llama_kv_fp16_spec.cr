@@ -135,6 +135,38 @@ describe "LlamaBlock fp16 KV cache" do
     fp8_blk.kv_cache_bytes.should eq(fp32_blk.kv_cache_bytes // 4)
   end
 
+  it "tensor-core prefill attention tracks the CPU path (head_dim 128, GQA)" do
+    pending! "CUDA kernels not available" unless SHAInet::CUDA.fully_available?
+
+    # head_dim 128 is one of the two shapes the WMMA prefill kernel serves; the other specs here
+    # use head dims it declines, so without this it would only be exercised by a real model.
+    d_model = 512
+    seq = 80
+    prng = Random.new(11)
+    prompt = SHAInet::SimpleMatrix.new(seq, d_model)
+    seq.times { |r| d_model.times { |c| prompt[r, c] = (prng.rand * 2.0 - 1.0) } }
+    steps = Array.new(2) do
+      tok = SHAInet::SimpleMatrix.new(1, d_model)
+      d_model.times { |c| tok[0, c] = (prng.rand * 2.0 - 1.0) }
+      tok
+    end
+
+    cpu_blk = SHAInet::LlamaBlock.new(d_model, 4, 256, num_kv_heads: 2)
+    {cpu_blk.w_q, cpu_blk.w_k, cpu_blk.w_v, cpu_blk.w_o}.each { |w| fill_random!(w, Random.new(42)) }
+    cpu_blk.force_cpu_attention = true
+    cpu_outs = drive(cpu_blk, prompt, steps)
+
+    gpu_blk = SHAInet::LlamaBlock.new(d_model, 4, 256, num_kv_heads: 2)
+    {gpu_blk.w_q, gpu_blk.w_k, gpu_blk.w_v, gpu_blk.w_o}.each { |w| fill_random!(w, Random.new(42)) }
+    gpu_outs = with_kv_fp16("1") { drive(gpu_blk, prompt, steps) }
+
+    # Q and P are rounded to half inside the kernel, so the bound is looser than the fp16-cache
+    # specs above, and still far below the activations' scale.
+    cpu_outs.each_with_index do |expected, i|
+      max_abs_diff(expected, gpu_outs[i]).should be < 2e-2
+    end
+  end
+
   it "stays correct through a device cache growth" do
     pending! "CUDA kernels not available" unless SHAInet::CUDA.fully_available?
 

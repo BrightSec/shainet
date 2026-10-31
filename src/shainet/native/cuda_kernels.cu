@@ -1,6 +1,7 @@
 #include <curand_kernel.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <mma.h>
 #include <cstdio>
 #include <cstdlib>
 #include "iq_tables.cuh"  // i-quant codebook grids in constant memory
@@ -1876,9 +1877,277 @@ int attention_prefill_f32(const float* q, const float* kc, const float* vc, floa
                                            heads_per_kv, head_dim, capacity, scale);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tensor-core prefill attention (WMMA, fp16 inputs, fp32 accumulation).
+//
+// The tiled kernel above does its dot products on CUDA cores out of shared memory, which is fine at
+// a few thousand tokens and dominant at tens of thousands: a 55K-token prefill spent ~540 s of 797 s
+// in it, because per-query work grows with context. This one does Q*K^T and P*V as 16x16x16 MMAs.
+//
+// A block owns 64 queries of one head (4 warps x 16 rows) and walks the keys in tiles of 32, with Q,
+// K and V staged in shared memory as half. fp8 and fp16 caches convert to half EXACTLY, so the only
+// rounding added is Q and P to half -- the same 10-bit mantissa TF32 matmuls already use. f32 caches
+// keep the CUDA-core kernel.
+//
+// Two passes over the keys rather than one online pass. WMMA accumulator fragments have an opaque
+// element-to-row mapping, so the per-row rescale an online softmax needs cannot be applied to the O
+// accumulators. Pass 1 computes each row's exact max and sum (scalars, which CAN be rescaled);
+// pass 2 recomputes the scores and accumulates the already-normalized P*V. Q*K^T runs twice, 1.5x
+// the FLOPs of one pass, all of it on tensor cores.
+#define PFW_BQ 64
+#define PFW_BK 32
+#define PFW_WARPS 4
+#define PFW_SPAD 4      // float row pad for the score tile (WMMA float ldm must be a multiple of 4)
+#define PFW_HPAD 8      // half row pad (ldm multiple of 8, and breaks bank alignment of rows)
+
+extern "C++" {
+// Eight consecutive cache elements as eight halves packed in a uint4. `p` is 8-element aligned.
+__device__ __forceinline__ uint4 kv_to_half8(const __half* p) {
+    return *((const uint4*)p);
+}
+__device__ __forceinline__ uint4 kv_to_half8(const __nv_fp8_e4m3* p) {
+    const uint2 raw = *((const uint2*)p);
+    uint4 r;
+    __half2_raw h;
+    h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(raw.x & 0xFFFF), __NV_E4M3);
+    r.x = (unsigned int)h.x | ((unsigned int)h.y << 16);
+    h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(raw.x >> 16), __NV_E4M3);
+    r.y = (unsigned int)h.x | ((unsigned int)h.y << 16);
+    h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(raw.y & 0xFFFF), __NV_E4M3);
+    r.z = (unsigned int)h.x | ((unsigned int)h.y << 16);
+    h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(raw.y >> 16), __NV_E4M3);
+    r.w = (unsigned int)h.x | ((unsigned int)h.y << 16);
+    return r;
+}
+
+template <typename KV, int D>
+__global__ void attention_prefill_wmma_kernel(const float* __restrict__ q,
+                                              const KV* __restrict__ kc,
+                                              const KV* __restrict__ vc,
+                                              float* __restrict__ out,
+                                              int new_tokens, int start_pos,
+                                              int num_heads, int heads_per_kv,
+                                              int capacity, float scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    extern __shared__ __align__(128) unsigned char pfw_raw[];
+    constexpr int HLD = D + PFW_HPAD;                 // half row stride of Q/K/V tiles
+    constexpr int SLD = PFW_BK + PFW_SPAD;            // float row stride of a warp's score tile
+    constexpr int PLD = PFW_BK + PFW_HPAD;            // half row stride of a warp's P tile
+    __half* Qs = (__half*)pfw_raw;                    // [BQ][HLD]
+    __half* Ks = Qs + PFW_BQ * HLD;                   // [BK][HLD]
+    __half* Vs = Ks + PFW_BK * HLD;                   // [BK][HLD]
+    float* Sall = (float*)(Vs + PFW_BK * HLD);        // [WARPS][16][SLD]
+    __half* Pall = (__half*)(Sall + PFW_WARPS * 16 * SLD); // [WARPS][16][PLD]
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int q0 = blockIdx.x * PFW_BQ;
+    const int h = blockIdx.y;
+    const int kv_h = h / heads_per_kv;
+    const int d_model = num_heads * D;
+    const int rows = min(PFW_BQ, new_tokens - q0);
+    const int kend = start_pos + q0 + rows;           // keys any query of the block may see
+    float* Ss = Sall + warp * 16 * SLD;
+    __half* Ps = Pall + warp * 16 * PLD;
+
+    const KV* kh = kc + (long)kv_h * capacity * D;
+    const KV* vh = vc + (long)kv_h * capacity * D;
+
+    for (int idx = tid; idx < PFW_BQ * D; idx += blockDim.x) {
+        const int qi = idx / D, d = idx - qi * D;
+        const float v = (qi < rows) ? q[(long)(q0 + qi) * d_model + (long)h * D + d] : 0.0f;
+        Qs[qi * HLD + d] = __float2half(v);
+    }
+
+    // Lane pair (2r, 2r+1) owns score row r of this warp's 16, each lane 16 of the 32 columns.
+    const int sr = lane >> 1;
+    const int sc0 = (lane & 1) * 16;
+    const int row_q = q0 + warp * 16 + sr;            // this lane's query index in the chunk
+    const bool row_ok = row_q < q0 + rows;
+    const int my_pos = start_pos + row_q;             // last key it may see
+    float m_i = -INFINITY, l_i = 0.0f;
+
+    // S = Q_w (16 x D) * K^T (D x 32) into this warp's score tile.
+    auto scores = [&]() {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s0, s1;
+        wmma::fill_fragment(s0, 0.0f);
+        wmma::fill_fragment(s1, 0.0f);
+        #pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b0, b1;
+            wmma::load_matrix_sync(a, Qs + (warp * 16) * HLD + kk * 16, HLD);
+            wmma::load_matrix_sync(b0, Ks + 0 * HLD + kk * 16, HLD);
+            wmma::load_matrix_sync(b1, Ks + 16 * HLD + kk * 16, HLD);
+            wmma::mma_sync(s0, a, b0, s0);
+            wmma::mma_sync(s1, a, b1, s1);
+        }
+        wmma::store_matrix_sync(Ss, s0, SLD, wmma::mem_row_major);
+        wmma::store_matrix_sync(Ss + 16, s1, SLD, wmma::mem_row_major);
+        __syncwarp();
+    };
+
+    // Eight cache elements per thread per step, converted to half8 and stored as one 16-byte write.
+    // Element-wise loads made this the kernel's bottleneck: one-byte fp8 loads, 64 per thread per
+    // tile, for a tile that is read twice (K) and once (V) per block.
+    auto load_kv_tile = [&](int j0, bool with_v) {
+        constexpr int V8 = D / 8;
+        for (int idx = tid; idx < PFW_BK * V8; idx += blockDim.x) {
+            const int kj = idx / V8, d = (idx - kj * V8) * 8;
+            const int j = j0 + kj;
+            uint4* kdst = (uint4*)(Ks + kj * HLD + d);
+            uint4* vdst = (uint4*)(Vs + kj * HLD + d);
+            if (j < kend) {
+                *kdst = kv_to_half8(kh + (long)j * D + d);
+                if (with_v) *vdst = kv_to_half8(vh + (long)j * D + d);
+            } else {
+                *kdst = make_uint4(0, 0, 0, 0);
+                if (with_v) *vdst = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    // Pass 1: exact row max and sum.
+    for (int j0 = 0; j0 < kend; j0 += PFW_BK) {
+        __syncthreads();
+        load_kv_tile(j0, false);
+        __syncthreads();
+        scores();
+        float tmax = -INFINITY;
+        float sv[16];
+        #pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            const int j = j0 + sc0 + c;
+            float s = -INFINITY;
+            if (row_ok && j <= my_pos && j < kend) s = Ss[sr * SLD + sc0 + c] * scale;
+            sv[c] = s;
+            tmax = fmaxf(tmax, s);
+        }
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFF, tmax, 1));
+        const float m_new = fmaxf(m_i, tmax);
+        // The shuffle stays OUTSIDE any row-dependent branch: rows past the end of the chunk have
+        // m_new == -inf, and a full-mask shuffle that some lanes skip deadlocks the warp.
+        float ts = 0.0f;
+        if (m_new != -INFINITY) {
+            #pragma unroll
+            for (int c = 0; c < 16; ++c) ts += (sv[c] == -INFINITY) ? 0.0f : expf(sv[c] - m_new);
+        }
+        ts += __shfl_xor_sync(0xFFFFFFFF, ts, 1);
+        if (m_new != -INFINITY) {
+            l_i = l_i * ((m_i == -INFINITY) ? 0.0f : expf(m_i - m_new)) + ts;
+            m_i = m_new;
+        }
+    }
+    const float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;
+
+    // Pass 2: O = sum over tiles of softmax(S) * V, with the final statistics.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[D / 16];
+    #pragma unroll
+    for (int f = 0; f < D / 16; ++f) wmma::fill_fragment(o[f], 0.0f);
+
+    for (int j0 = 0; j0 < kend; j0 += PFW_BK) {
+        __syncthreads();
+        load_kv_tile(j0, true);
+        __syncthreads();
+        scores();
+        #pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            const int j = j0 + sc0 + c;
+            float p = 0.0f;
+            if (row_ok && j <= my_pos && j < kend)
+                p = expf(Ss[sr * SLD + sc0 + c] * scale - m_i) * inv_l;
+            Ps[sr * PLD + sc0 + c] = __float2half(p);
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int kk = 0; kk < PFW_BK / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa;
+            wmma::load_matrix_sync(pa, Ps + kk * 16, PLD);
+            #pragma unroll
+            for (int f = 0; f < D / 16; ++f) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb;
+                wmma::load_matrix_sync(vb, Vs + (kk * 16) * HLD + f * 16, HLD);
+                wmma::mma_sync(o[f], pa, vb, o[f]);
+            }
+        }
+    }
+
+    // Stage each 16x16 output fragment through the warp's score tile and write the valid rows.
+    const int wrow0 = q0 + warp * 16;
+    #pragma unroll
+    for (int f = 0; f < D / 16; ++f) {
+        __syncwarp();
+        wmma::store_matrix_sync(Ss, o[f], SLD, wmma::mem_row_major);
+        __syncwarp();
+        for (int e = lane; e < 256; e += 32) {
+            const int r = e >> 4, c = e & 15;
+            if (wrow0 + r < q0 + rows)
+                out[(long)(wrow0 + r) * d_model + (long)h * D + f * 16 + c] = Ss[r * SLD + c];
+        }
+    }
+#endif
+}
+
+template <typename KV, int D>
+static int attention_prefill_wmma_launch_d(const float* q, const KV* kc, const KV* vc, float* out,
+                                           int new_tokens, int start_pos, int num_heads,
+                                           int heads_per_kv, int capacity, float scale) {
+    constexpr int HLD = D + PFW_HPAD;
+    const size_t smem = (size_t)(PFW_BQ + 2 * PFW_BK) * HLD * sizeof(__half) +
+                        (size_t)PFW_WARPS * 16 * (PFW_BK + PFW_SPAD) * sizeof(float) +
+                        (size_t)PFW_WARPS * 16 * (PFW_BK + PFW_HPAD) * sizeof(__half);
+    static int state = 0;   // 0 untested, 1 usable, -1 refused
+    if (state == 0) {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        state = (major >= 7 &&
+                 cudaFuncSetAttribute(attention_prefill_wmma_kernel<KV, D>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      (int)smem) == cudaSuccess) ? 1 : -1;
+        cudaGetLastError();
+    }
+    if (state < 0) return 0;
+    dim3 grid((new_tokens + PFW_BQ - 1) / PFW_BQ, num_heads);
+    attention_prefill_wmma_kernel<KV, D><<<grid, PFW_WARPS * 32, smem>>>(
+        q, kc, vc, out, new_tokens, start_pos, num_heads, heads_per_kv, capacity, scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in attention_prefill_wmma: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+
+// 1 when the tensor-core kernel ran; 0 hands the call to the CUDA-core tiled kernel.
+template <typename KV>
+static int attention_prefill_wmma_launch(const float* q, const KV* kc, const KV* vc, float* out,
+                                         int new_tokens, int start_pos, int num_heads,
+                                         int heads_per_kv, int head_dim, int capacity, float scale) {
+    static const bool enabled = [] {
+        const char* e = getenv("SHAINET_WMMA_PREFILL_ATTN");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || new_tokens <= 0) return 0;
+    switch (head_dim) {
+    case 128: return attention_prefill_wmma_launch_d<KV, 128>(q, kc, vc, out, new_tokens, start_pos,
+                                                              num_heads, heads_per_kv, capacity, scale);
+    case 256: return attention_prefill_wmma_launch_d<KV, 256>(q, kc, vc, out, new_tokens, start_pos,
+                                                              num_heads, heads_per_kv, capacity, scale);
+    default: return 0;
+    }
+}
+} // extern "C++"
+
 int attention_prefill_f16(const float* q, const unsigned short* kc, const unsigned short* vc,
                           float* out, int new_tokens, int start_pos, int num_heads,
                           int heads_per_kv, int head_dim, int capacity, float scale) {
+    if (attention_prefill_wmma_launch<__half>(q, reinterpret_cast<const __half*>(kc),
+                                              reinterpret_cast<const __half*>(vc), out, new_tokens,
+                                              start_pos, num_heads, heads_per_kv, head_dim,
+                                              capacity, scale)) return 1;
     return attention_prefill_launch<__half>(q, reinterpret_cast<const __half*>(kc),
                                             reinterpret_cast<const __half*>(vc), out, new_tokens,
                                             start_pos, num_heads, heads_per_kv, head_dim,
@@ -1888,6 +2157,10 @@ int attention_prefill_f16(const float* q, const unsigned short* kc, const unsign
 int attention_prefill_fp8(const float* q, const unsigned char* kc, const unsigned char* vc,
                           float* out, int new_tokens, int start_pos, int num_heads,
                           int heads_per_kv, int head_dim, int capacity, float scale) {
+    if (attention_prefill_wmma_launch<__nv_fp8_e4m3>(q, reinterpret_cast<const __nv_fp8_e4m3*>(kc),
+                                                     reinterpret_cast<const __nv_fp8_e4m3*>(vc), out,
+                                                     new_tokens, start_pos, num_heads, heads_per_kv,
+                                                     head_dim, capacity, scale)) return 1;
     return attention_prefill_launch<__nv_fp8_e4m3>(q, reinterpret_cast<const __nv_fp8_e4m3*>(kc),
                                                    reinterpret_cast<const __nv_fp8_e4m3*>(vc), out,
                                                    new_tokens, start_pos, num_heads, heads_per_kv,
