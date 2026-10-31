@@ -42,6 +42,7 @@ module SHAInet
                          alpha : Pointer(Float32),
                          x : Pointer(Float32), incx : Int32,
                          y : Pointer(Float32), incy : Int32) : Int32
+      fun cublasSetPointerMode_v2(handle : Handle, mode : Int32) : Int32
       fun cublasGemmEx(handle : Handle, transa : Int32, transb : Int32,
                        m : Int32, n : Int32, k : Int32,
                        alpha : Void*, a : Void*, atype : Int32, lda : Int32,
@@ -332,6 +333,40 @@ module SHAInet
         b.as(Void*), CUDA_R_16F, ldb,
         pointerof(beta).as(Void*), c.as(Void*), CUDA_R_32F, ldc,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)
+    end
+
+    # gemm_tn_f16 with alpha and beta read from DEVICE memory (alpha_beta[0], alpha_beta[1]), so a
+    # scale computed on the device applies without a host round trip. The handle is pooled, so the
+    # pointer mode is restored before returning.
+    def gemm_tn_f16_device_alpha(handle : LibCUBLAS::Handle, a : Pointer(UInt16), b : Pointer(UInt16),
+                                 c : Pointer(Float32), alpha_beta : Pointer(Float32),
+                                 m : Int32, n : Int32, k : Int32, lda : Int32, ldb : Int32, ldc : Int32) : Int32
+      LibCUBLAS.cublasSetPointerMode_v2(handle, 1)
+      begin
+        LibCUBLAS.cublasGemmEx(handle,
+          Operation::T.value, Operation::N.value,
+          m, n, k,
+          alpha_beta.as(Void*), a.as(Void*), CUDA_R_16F, lda,
+          b.as(Void*), CUDA_R_16F, ldb,
+          (alpha_beta + 1).as(Void*), c.as(Void*), CUDA_R_32F, ldc,
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)
+      ensure
+        LibCUBLAS.cublasSetPointerMode_v2(handle, 0)
+      end
+    end
+
+    @@matrix_to_f16_scaled_proc : Proc(Pointer(Float32), Pointer(UInt16), Pointer(Float32), Pointer(UInt32), Int32, Int32, Nil)?
+
+    # Activations [m, k] to half with one power-of-two scale; alpha_beta receives {1/scale, 0}.
+    # False when the kernel is missing from the loaded library.
+    def matrix_to_f16_scaled(x : Pointer(Float32), xh : Pointer(UInt16), alpha_beta : Pointer(Float32),
+                             work : Pointer(UInt32), m : Int32, k : Int32) : Bool
+      @@matrix_to_f16_scaled_proc ||= load_kernel_proc("matrix_to_f16_scaled",
+        Proc(Pointer(Float32), Pointer(UInt16), Pointer(Float32), Pointer(UInt32), Int32, Int32, Nil))
+      fn = @@matrix_to_f16_scaled_proc
+      return false unless fn
+      fn.call(x, xh, alpha_beta, work, m, k)
+      true
     end
 
     @@dequant_f16_procs = Hash(String, Proc(Pointer(UInt8), Pointer(UInt16), Int32, Int32, Int32, Nil)?).new

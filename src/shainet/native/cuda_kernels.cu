@@ -3412,6 +3412,54 @@ void rows_to_f16_scaled(const float* x, unsigned short* xh, float* inv_scale, in
     rows_to_f16_scaled_kernel<<<M, 256>>>(x, (__half*)xh, inv_scale, K);
 }
 
+// One power-of-two scale for the whole activation matrix, applied by cuBLAS as alpha.
+//
+// The per-row variant above needs scale_rows over the GEMM output afterwards: ~115 us per call at a
+// 1024-token chunk, 0.23 s of a 3.5K-token prefill, spent rewriting the whole output. One scale for
+// the matrix needs no pass at all -- cuBLAS applies 1/scale as alpha, read from device memory so
+// nothing waits on the host. fp16 spans ~2.7e8 between the scaled maximum (2^14) and its subnormal
+// edge, far more than activations in one chunk spread, so a shared scale costs no precision.
+//
+// `scales` receives {1/scale, 0}: alpha and beta for the device-pointer-mode GEMM.
+__global__ void absmax_bits_kernel(const float* __restrict__ x, long n, unsigned int* __restrict__ out) {
+    float m = 0.0f;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
+        m = fmaxf(m, fabsf(x[i]));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFF, m, o));
+    // Non-negative floats order like their bit patterns, so an integer atomicMax is a float max.
+    if ((threadIdx.x & 31) == 0 && isfinite(m)) atomicMax(out, __float_as_uint(m));
+}
+
+__global__ void to_f16_global_scaled_kernel(const float* __restrict__ x, __half* __restrict__ xh, long n,
+                                            const unsigned int* __restrict__ maxbits,
+                                            float* __restrict__ scales) {
+    const float mx = __uint_as_float(*maxbits);
+    float scale = 1.0f;
+    if (mx > 0.0f) {
+        int e;
+        frexpf(mx, &e);
+        scale = ldexpf(1.0f, 14 - e);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        scales[0] = 1.0f / scale;
+        scales[1] = 0.0f;
+    }
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
+        xh[i] = __float2half(x[i] * scale);
+}
+
+// `work` is one uint of scratch for the reduction.
+void matrix_to_f16_scaled(const float* x, unsigned short* xh, float* scales, unsigned int* work, int M, int K) {
+    const long n = (long)M * K;
+    if (n <= 0) return;
+    cudaMemsetAsync(work, 0, sizeof(unsigned int));
+    long blocks = (n + 255) / 256;
+    if (blocks > 4096) blocks = 4096;
+    absmax_bits_kernel<<<(unsigned int)blocks, 256>>>(x, n, work);
+    to_f16_global_scaled_kernel<<<(unsigned int)blocks, 256>>>(x, (__half*)xh, n, work, scales);
+}
+
 // y[r, :] *= s[r] for a row-major [M, N].
 __global__ void scale_rows_kernel(float* __restrict__ y, const float* __restrict__ s, int N) {
     const int r = blockIdx.y;

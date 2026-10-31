@@ -172,6 +172,14 @@ module SHAInet
       false
     end
 
+    def gemm_tn_f16_device_alpha(*args) : Int32
+      raise "CUDA disabled"
+    end
+
+    def matrix_to_f16_scaled(*args) : Bool
+      false
+    end
+
     def mmq_available? : Bool
       false
     end

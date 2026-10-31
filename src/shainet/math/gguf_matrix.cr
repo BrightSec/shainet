@@ -344,10 +344,10 @@ module SHAInet
     # scales per 32-wide k step. One byte per weight through the scratch instead of the fp16 path's
     # two, and int8 MMA instead of fp16.
     #
-    # Activations lose precision to int8 (per-32 absmax), which is the trade llama.cpp makes for its
-    # prefill -- greedy output does change. Opt-in with SHAINET_MMQ=1: measured on the 27B GSQ IQ3_S
-    # it is +11% prefill at 1024-token chunks and about even at 512, for ~80 MB more scratch, and the
-    # fp16 path at the same chunk keeps fp16-class precision.
+    # Activations lose precision to int8 (per-32 absmax) -- the same trade llama.cpp, and so Ollama,
+    # makes for its prefill on these types, and greedy output does change against the fp16 path.
+    # Measured on the 27B GSQ IQ3_S at a 1024-token chunk: 673 tok/s against 609 for fp16.
+    # SHAINET_MMQ=0 keeps the fp16 path.
     @@mmq : Bool? = nil
     @@mq_w : Pointer(Int8) = Pointer(Int8).null
     @@mq_w_elems : Int64 = 0_i64
@@ -362,17 +362,17 @@ module SHAInet
     @@mq_xsum : Pointer(Float32) = Pointer(Float32).null
     @@mq_xsum_elems : Int64 = 0_i64
 
-    # Rows decoded per GEMM launch. Not small: a 2048-row slice at a 256-token chunk is a 32-block
-    # grid on a 76-SM card, measured 3x slower than at 8192. 4096 keeps the int8 scratch near 80 MB
-    # at K=17408 while the grid stays full at the 512+ token chunks the path is worth using at.
-    MMQ_SLICE_ROWS = 4096
+    # Rows decoded per GEMM launch. The int8 slice is written by the decode and read straight back by
+    # the GEMM, so it has to stay in L2: at a 1024-token chunk, 1024 rows gave 673 tok/s, 2048 gave
+    # 649 and 4096 gave 634 (71 MB at K=17408, past the 64 MB L2). SHAINET_MMQ_SLICE_ROWS overrides.
+    MMQ_SLICE_ROWS = (ENV["SHAINET_MMQ_SLICE_ROWS"]?.try(&.to_i?) || 1024)
 
     MMQ_TYPES = {GGUF::GGMLType::Q4_K, GGUF::GGMLType::IQ4_XS, GGUF::GGMLType::IQ3_S, GGUF::GGMLType::IQ3_XXS}
 
     def self.mmq? : Bool
       flag = @@mmq
       return flag unless flag.nil?
-      flag = ENV.fetch("SHAINET_MMQ", "0") == "1" && CUDA.fully_available? && CUDA.mmq_available?
+      flag = ENV.fetch("SHAINET_MMQ", "1") != "0" && CUDA.fully_available? && CUDA.mmq_available?
       @@mmq = flag
       flag
     end
@@ -468,6 +468,16 @@ module SHAInet
 
     # Returns false when this weight or device cannot take the fp16 path, leaving gemm_into's TF32
     # path to run.
+    # Scratch budget for one dequantized fp16 slice, which the GEMM reads straight back. Small on
+    # purpose: the slice has to stay in L2 (64 MB here) between the dequant writing it and the GEMM
+    # reading it. Measured at a 1024-token chunk on the 27B: 10-20 MB -> 603 tok/s, 40 MB -> 596,
+    # 96 MB -> 525 -- a fuller GEMM grid does not pay for re-reading the slice from DRAM. 20 MB is
+    # 2048 rows at K=5120 and the 1024-row floor at K=17408. SHAINET_F16_SCRATCH_MB overrides.
+    F16_SCRATCH_BYTES = (ENV["SHAINET_F16_SCRATCH_MB"]?.try(&.to_i64?) || 20_i64) * 1024 * 1024
+
+    @@alpha_beta : Pointer(Float32) = Pointer(Float32).null
+    @@absmax_work : Pointer(UInt32) = Pointer(UInt32).null
+
     private def gemm_into_f16(x : CudaMatrix, result : CudaMatrix) : Bool
       return false unless GGUFMatrix.f16_gemm?
       name = F16_DEQUANT_NAMES[@ggml_type]?
@@ -475,14 +485,30 @@ module SHAInet
 
       k = @rows
       m = x.rows
-      chunk = SCRATCH_ROWS > @cols ? @cols : SCRATCH_ROWS
+      chunk = (F16_SCRATCH_BYTES // (2_i64 * k)).to_i32
+      chunk = SCRATCH_ROWS if chunk < SCRATCH_ROWS
+      chunk = @cols if chunk > @cols
       @@scratch_h, @@scratch_h_elems = GGUFMatrix.grow(@@scratch_h, @@scratch_h_elems, chunk.to_i64 * k)
       @@xh, @@xh_elems = GGUFMatrix.grow(@@xh, @@xh_elems, m.to_i64 * k)
-      ip, ie = GGUFMatrix.grow(@@inv_scale, @@inv_scale_elems.to_i64, m.to_i64)
-      @@inv_scale, @@inv_scale_elems = ip, ie.to_i32
-      return false if @@scratch_h.null? || @@xh.null? || @@inv_scale.null?
+      if @@alpha_beta.null?
+        p = Pointer(Void).null
+        CUDA.malloc(pointerof(p), 16_u64)
+        @@alpha_beta = p.as(Pointer(Float32))
+        q = Pointer(Void).null
+        CUDA.malloc(pointerof(q), 16_u64)
+        @@absmax_work = q.as(Pointer(UInt32))
+      end
+      return false if @@scratch_h.null? || @@xh.null? || @@alpha_beta.null? || @@absmax_work.null?
 
-      CUDA.rows_to_f16_scaled(x.device_ptr.not_nil!, @@xh, @@inv_scale, m, k)
+      # One scale for the matrix, applied by cuBLAS as alpha; the per-row scale and its output pass
+      # remain only for a kernel library that predates the global one.
+      global = CUDA.matrix_to_f16_scaled(x.device_ptr.not_nil!, @@xh, @@alpha_beta, @@absmax_work, m, k)
+      unless global
+        ip, ie = GGUFMatrix.grow(@@inv_scale, @@inv_scale_elems.to_i64, m.to_i64)
+        @@inv_scale, @@inv_scale_elems = ip, ie.to_i32
+        return false if @@inv_scale.null?
+        CUDA.rows_to_f16_scaled(x.device_ptr.not_nil!, @@xh, @@inv_scale, m, k)
+      end
       rp = result.device_ptr.not_nil!
       handle = CUDA.create_handle(tf32: true)
       begin
@@ -491,14 +517,19 @@ module SHAInet
           rows = @cols - row0
           rows = chunk if rows > chunk
           return false unless CUDA.dequant_rows_f16(name, @dev_ptr, @@scratch_h, row0, rows, k)
-          status = CUDA.gemm_tn_f16(handle, @@scratch_h, @@xh, rp + row0, rows, m, k, k, k, @cols)
+          status = if global
+                     CUDA.gemm_tn_f16_device_alpha(handle, @@scratch_h, @@xh, rp + row0, @@alpha_beta,
+                       rows, m, k, k, k, @cols)
+                   else
+                     CUDA.gemm_tn_f16(handle, @@scratch_h, @@xh, rp + row0, rows, m, k, k, k, @cols)
+                   end
           raise "cublasGemmEx failed (status #{status})" unless status == 0
           row0 += rows
         end
       ensure
         CUDA.destroy_handle(handle)
       end
-      CUDA.scale_rows(rp, @@inv_scale, m, @cols)
+      CUDA.scale_rows(rp, @@inv_scale, m, @cols) unless global
       result.mark_device_dirty!
       true
     end

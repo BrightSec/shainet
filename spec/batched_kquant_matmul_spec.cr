@@ -107,7 +107,13 @@ describe "batched k-quant matmul" do
 
     gemm = SHAInet::CudaMatrix.new(m, n)
     gemv = SHAInet::CudaMatrix.new(m, n)
-    w.gemm_into(x, gemm)
+    # The dequant + cuBLAS path specifically; the int8 MMQ path has its own example below.
+    SHAInet::GGUFMatrix.mmq = false
+    begin
+      w.gemm_into(x, gemm)
+    ensure
+      SHAInet::GGUFMatrix.mmq = nil
+    end
     SHAInet::CUDA.gemv_q4k(x.device_ptr.not_nil!, w.dev_ptr, gemv.device_ptr.not_nil!, m, n, k)
     gemv.mark_device_dirty!
     gemm.sync_from_device!("spec_gemm")
