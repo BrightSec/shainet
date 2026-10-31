@@ -351,6 +351,47 @@ module SHAInet
       true
     end
 
+    @@mmq_checked = false
+    @@mmq_ok = false
+    @@mmq_quantize_proc : Proc(Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Nil)?
+    @@mmq_decode_proc : Proc(Int32, Pointer(UInt8), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32)?
+    @@mmq_gemm_proc : Proc(Int32, Pointer(Int8), Pointer(Float32), Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32)?
+
+    # Whether the int8 MMQ prefill kernels are present and the device can run them (sm_80+).
+    def mmq_available? : Bool
+      unless @@mmq_checked
+        @@mmq_checked = true
+        avail = load_kernel_proc("mmq_available", Proc(Int32))
+        @@mmq_quantize_proc = load_kernel_proc("mmq_quantize_x",
+          Proc(Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Nil))
+        @@mmq_decode_proc = load_kernel_proc("mmq_decode_rows",
+          Proc(Int32, Pointer(UInt8), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32))
+        @@mmq_gemm_proc = load_kernel_proc("mmq_gemm",
+          Proc(Int32, Pointer(Int8), Pointer(Float32), Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32))
+        @@mmq_ok = !avail.nil? && avail.call != 0 && !@@mmq_quantize_proc.nil? &&
+                   !@@mmq_decode_proc.nil? && !@@mmq_gemm_proc.nil?
+      end
+      @@mmq_ok
+    end
+
+    # Activations [m, k] to int8 per 32-value block: values, scales and float block sums.
+    def mmq_quantize_x(x : Pointer(Float32), xq : Pointer(Int8), xs : Pointer(Float32), xsum : Pointer(Float32), m : Int32, k : Int32)
+      @@mmq_quantize_proc.not_nil!.call(x, xq, xs, xsum, m, k)
+    end
+
+    # Decode `rows` weight rows from `row0` to int8 + per-32 scales (+ offsets). False for a type the
+    # int8 path does not cover.
+    def mmq_decode_rows(ggml_type : Int32, w : Pointer(UInt8), wq : Pointer(Int8), ws : Pointer(Float32),
+                        wo : Pointer(Float32), row0 : Int32, rows : Int32, k : Int32) : Bool
+      @@mmq_decode_proc.not_nil!.call(ggml_type, w, wq, ws, wo, row0, rows, k) != 0
+    end
+
+    def mmq_gemm(offset : Bool, xq : Pointer(Int8), xs : Pointer(Float32), xsum : Pointer(Float32),
+                 wq : Pointer(Int8), ws : Pointer(Float32), wo : Pointer(Float32), y : Pointer(Float32),
+                 m : Int32, rows : Int32, k : Int32, ldy : Int32) : Bool
+      @@mmq_gemm_proc.not_nil!.call(offset ? 1 : 0, xq, xs, xsum, wq, ws, wo, y, m, rows, k, ldy) != 0
+    end
+
     # Whether the fp16 prefill GEMM's helper kernels are present.
     def f16_gemm_helpers_available? : Bool
       @@rows_to_f16_scaled_proc ||= load_kernel_proc("rows_to_f16_scaled",

@@ -219,6 +219,11 @@ module SHAInet
             next unless idx >= cpu_layers
             gf.tensors.each do |name, info|
               if name.starts_with?("blk.#{idx}.")
+                # A gated attn_q is split into Q and gate halves from the HOST bytes, and the halves
+                # get their own device allocations (split_gguf_q_gate), so the combined tensor is
+                # never read on the device. Uploading it anyway held a dead copy: 377 MB on the 27B,
+                # VRAM that the prefill chunk and the KV cache are both short of.
+                next if name == "blk.#{idx}.attn_q.weight" && info.shape[1] == 2_u64 * n_heads * head_dim
                 gpu_tensor_ranges << {info.offset, info.byte_size}
               end
             end
@@ -391,31 +396,32 @@ module SHAInet
       # the middle of a long prefill -- turning a speed knob into a crash.
       kv_mb = (kv_per_token * max_context) // (1024 * 1024)
       headroom_mb = free_mb - kv_mb
-      # Each tier demands roughly three times what the chunk itself costs (about 550 MB at 1024,
-      # 156 MB at 512), so a mis-estimate degrades throughput rather than killing the run.
+      # Measured, not estimated, on the 27B GSQ IQ3_S at 64K context with the fp8 KV cache pinned at
+      # full size: with 1630 MB of projected headroom, chunk 1024 left 778 MB free after a 3.5K-token
+      # prefill and 717 MB after a 55K-token one, so the tier costs ~910 MB of the projection at its
+      # worst (long context). Chunk 256 costs ~330 MB and 512 about 565.
       #
-      # The 1400 floor is deliberately above what 512 costs. A 64K load projects about 1049 MB of
-      # headroom, and the only configuration actually observed surviving a 60000-token prefill is the
-      # 256 floor, which finished with 506 MB to spare. Raising that run to 512 was never tested, so
-      # it stays on the floor rather than shipping an untested tier into the case with least room.
-      chunk = if headroom_mb > 1800
+      # Each tier keeps roughly 400 MB spare beyond that cost: other processes share the card, and
+      # their VRAM use moved by 100-250 MB over a single long run. The thresholds were 1800/1400 when
+      # the prefill matmul dequantized to fp32 and the gated attn_q was uploaded twice, which kept
+      # every 64K session on the slowest tier (~400 tok/s at 3.5K tokens against ~590 at 1024, and
+      # 797 s against 128 s for a 55K-token prefill).
+      chunk = if headroom_mb >= 1300
                 1024
-              elsif headroom_mb > 1400
+              elsif headroom_mb >= 1000
                 512
               else
                 256
               end
       # Log the floor case too, and say what it costs.
       #
-      # This returned silently at 256, so the slowest tier was the one configuration that left no trace
-      # -- and it is the tier a 64K context always lands on, since that projects about 1049 MB of
-      # headroom against the 1400 floor. Measured on this model: 256 gives about 128 tok/s where 512
-      # gives 150 and 1024 gives 179-185, so a silent floor is a silent 1.4x. Anyone reading a slow
-      # prefill in the log now has the number and the override in front of them.
+      # This returned silently at 256, so the slowest tier was the one configuration that left no trace.
+      # A silent floor is a silent ~1.5x on prefill; anyone reading a slow prefill in the log now has
+      # the number and the override in front of them.
       if chunk == 256
         Log.info do
-          "gguf: prefill chunk 256 (floor; #{headroom_mb} MB projected headroom < 1400). This is the " \
-          "slowest tier -- about 128 tok/s against 179-185 at 1024. Override with " \
+          "gguf: prefill chunk 256 (floor; #{headroom_mb} MB projected headroom < 1000). This is the " \
+          "slowest tier -- about 400 tok/s against ~590 at 1024 on a 27B. Override with " \
           "SHAINET_PREFILL_CHUNK=1024 if your prompts stay well short of #{max_context} tokens."
         end
         return

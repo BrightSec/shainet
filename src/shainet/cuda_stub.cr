@@ -172,6 +172,22 @@ module SHAInet
       false
     end
 
+    def mmq_available? : Bool
+      false
+    end
+
+    def mmq_quantize_x(*args)
+      raise "CUDA disabled"
+    end
+
+    def mmq_decode_rows(*args) : Bool
+      false
+    end
+
+    def mmq_gemm(*args) : Bool
+      false
+    end
+
     def rows_to_f16_scaled(*args)
       raise "CUDA disabled"
     end

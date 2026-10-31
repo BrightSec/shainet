@@ -125,4 +125,52 @@ describe "batched k-quant matmul" do
     w.free!
     SHAInet::GGUFMatrix.release_scratch!
   end
+
+  it "int8 MMQ GEMM agrees with the per-token GEMV", tags: "cuda" do
+    pending! "no CUDA" unless SHAInet::CUDA.fully_available?
+    pending! "no int8 MMQ kernels or device below sm_80" unless SHAInet::CUDA.mmq_available?
+
+    # Shapes past one tile in every direction, with partial tiles: 300 tokens over 128-token tiles,
+    # 200 rows over 128-row tiles, two 256-value blocks along K.
+    k = 512
+    n = 200
+    m = 300
+    block = build_q4k_block
+    blocks_per_row = k // 256
+    host = Pointer(UInt8).malloc(n * blocks_per_row * 144)
+    (n * blocks_per_row).times do |b|
+      block.each_with_index { |byte, i| host[b * 144 + i] = i == 0 ? (byte + b % 7).to_u8! : (i >= 16 ? (byte ^ (b % 5)).to_u8 : byte) }
+    end
+
+    w = SHAInet::GGUFMatrix.new(k, n, SHAInet::GGUF::GGMLType::Q4_K, host, (n * blocks_per_row * 144).to_u64)
+    x = SHAInet::CudaMatrix.new(m, k)
+    (m * k).times { |i| x.raw_data[i] = (0.5 * Math.sin(i * 0.013) + 0.1 * Math.cos(i * 0.71)).to_f32 }
+    x.mark_host_modified!
+    x.sync_to_device!("spec_in")
+
+    mmq = SHAInet::CudaMatrix.new(m, n)
+    gemv = SHAInet::CudaMatrix.new(m, n)
+    SHAInet::GGUFMatrix.mmq = true
+    begin
+      w.gemm_into(x, mmq)
+    ensure
+      SHAInet::GGUFMatrix.mmq = nil
+    end
+    SHAInet::CUDA.gemv_q4k(x.device_ptr.not_nil!, w.dev_ptr, gemv.device_ptr.not_nil!, m, n, k)
+    gemv.mark_device_dirty!
+    mmq.sync_from_device!("spec_mmq")
+    gemv.sync_from_device!("spec_gemv")
+
+    # int8 activations (per-32 absmax) cost about 1e-3 of the output scale; a wrong tile index,
+    # scale or offset costs order 1.
+    scale = (0...(m * n)).max_of { |i| gemv.raw_data[i].abs }
+    (m * n).times do |i|
+      ((mmq.raw_data[i] - gemv.raw_data[i]).abs / scale).should be < 1e-2
+    end
+
+    x.free!
+    mmq.free!
+    gemv.free!
+    w.free!
+  end
 end

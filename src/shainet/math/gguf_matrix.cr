@@ -278,6 +278,7 @@ module SHAInet
     # transposed operand and ldc set to the FULL N, each chunk writes straight into its own
     # columns of the finished result.
     def gemm_into(x : CudaMatrix, result : CudaMatrix) : CudaMatrix
+      return result if gemm_into_mmq(x, result)
       return result if gemm_into_f16(x, result)
 
       k = @rows
@@ -333,6 +334,82 @@ module SHAInet
         CUDA.free(@dev_ptr.as(Pointer(Void)))
         @dev_ptr = Pointer(UInt8).null
       end
+    end
+
+    # ── int8 MMQ prefill GEMM ──
+    #
+    # For the types it covers (Q4_K, IQ4_XS, IQ3_S, IQ3_XXS -- most of the bytes of the i-quant
+    # builds), the weight slice is decoded once to int8 with a scale per 32 values, the activations
+    # are quantized the same way (llama.cpp's q8 scheme), and an int8 tensor-core GEMM applies the
+    # scales per 32-wide k step. One byte per weight through the scratch instead of the fp16 path's
+    # two, and int8 MMA instead of fp16.
+    #
+    # Activations lose precision to int8 (per-32 absmax), which is the trade llama.cpp makes for its
+    # prefill -- greedy output does change. Opt-in with SHAINET_MMQ=1: measured on the 27B GSQ IQ3_S
+    # it is +11% prefill at 1024-token chunks and about even at 512, for ~80 MB more scratch, and the
+    # fp16 path at the same chunk keeps fp16-class precision.
+    @@mmq : Bool? = nil
+    @@mq_w : Pointer(Int8) = Pointer(Int8).null
+    @@mq_w_elems : Int64 = 0_i64
+    @@mq_ws : Pointer(Float32) = Pointer(Float32).null
+    @@mq_ws_elems : Int64 = 0_i64
+    @@mq_wo : Pointer(Float32) = Pointer(Float32).null
+    @@mq_wo_elems : Int64 = 0_i64
+    @@mq_x : Pointer(Int8) = Pointer(Int8).null
+    @@mq_x_elems : Int64 = 0_i64
+    @@mq_xs : Pointer(Float32) = Pointer(Float32).null
+    @@mq_xs_elems : Int64 = 0_i64
+    @@mq_xsum : Pointer(Float32) = Pointer(Float32).null
+    @@mq_xsum_elems : Int64 = 0_i64
+
+    # Rows decoded per GEMM launch. Not small: a 2048-row slice at a 256-token chunk is a 32-block
+    # grid on a 76-SM card, measured 3x slower than at 8192. 4096 keeps the int8 scratch near 80 MB
+    # at K=17408 while the grid stays full at the 512+ token chunks the path is worth using at.
+    MMQ_SLICE_ROWS = 4096
+
+    MMQ_TYPES = {GGUF::GGMLType::Q4_K, GGUF::GGMLType::IQ4_XS, GGUF::GGMLType::IQ3_S, GGUF::GGMLType::IQ3_XXS}
+
+    def self.mmq? : Bool
+      flag = @@mmq
+      return flag unless flag.nil?
+      flag = ENV.fetch("SHAINET_MMQ", "0") == "1" && CUDA.fully_available? && CUDA.mmq_available?
+      @@mmq = flag
+      flag
+    end
+
+    # Force the choice (nil re-reads SHAINET_MMQ on next use). For specs and A/B runs.
+    def self.mmq=(value : Bool?)
+      @@mmq = value
+    end
+
+    private def gemm_into_mmq(x : CudaMatrix, result : CudaMatrix) : Bool
+      return false unless MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
+      k = @rows
+      m = x.rows
+      nb = (k // 32).to_i64
+      slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
+      @@mq_w, @@mq_w_elems = GGUFMatrix.grow(@@mq_w, @@mq_w_elems, slice.to_i64 * k)
+      @@mq_ws, @@mq_ws_elems = GGUFMatrix.grow(@@mq_ws, @@mq_ws_elems, slice.to_i64 * nb)
+      @@mq_wo, @@mq_wo_elems = GGUFMatrix.grow(@@mq_wo, @@mq_wo_elems, slice.to_i64 * nb)
+      @@mq_x, @@mq_x_elems = GGUFMatrix.grow(@@mq_x, @@mq_x_elems, m.to_i64 * k)
+      @@mq_xs, @@mq_xs_elems = GGUFMatrix.grow(@@mq_xs, @@mq_xs_elems, m.to_i64 * nb)
+      @@mq_xsum, @@mq_xsum_elems = GGUFMatrix.grow(@@mq_xsum, @@mq_xsum_elems, m.to_i64 * nb)
+      return false if @@mq_w.null? || @@mq_ws.null? || @@mq_wo.null? || @@mq_x.null? || @@mq_xs.null? || @@mq_xsum.null?
+
+      CUDA.mmq_quantize_x(x.device_ptr.not_nil!, @@mq_x, @@mq_xs, @@mq_xsum, m, k)
+      rp = result.device_ptr.not_nil!
+      offset = @ggml_type.q4_k?
+      row0 = 0
+      while row0 < @cols
+        rows = @cols - row0
+        rows = slice if rows > slice
+        return false unless CUDA.mmq_decode_rows(@ggml_type.value.to_i32, @dev_ptr, @@mq_w, @@mq_ws, @@mq_wo, row0, rows, k)
+        return false unless CUDA.mmq_gemm(offset, @@mq_x, @@mq_xs, @@mq_xsum, @@mq_w, @@mq_ws, @@mq_wo,
+                              rp + row0, m, rows, k, @cols)
+        row0 += rows
+      end
+      result.mark_device_dirty!
+      true
     end
 
     # ── fp16 tensor-core prefill GEMM ──

@@ -812,10 +812,17 @@ module SHAInet
       # is the smaller d_model-wide tensor.
       aq = attn_ws(@@attn_ws_aq, n, qdim)
 
-      max_chunk = attn_chunk_tokens(total_len)
+      # The tiled prefill kernels need no workspace, so when they will serve this chunk none of the
+      # workspace-driven limits apply: not the score-row budget in attn_chunk_tokens, not the split
+      # cap, not the split workspace itself. Those were sized for kernels that stage scores in global
+      # memory; applied to the tiled kernel they cut a 1024-token chunk to ~12 queries per call at 55K
+      # of context -- against 64-query tiles -- and grew a 48 -> 97 MB buffer nothing read. attend_kv
+      # sizes the workspace itself if a kernel declines and a workspace path runs after all.
+      tiled = n > 1 && use_tiled_prefill_attn? && head_dim % 16 == 0 && head_dim <= 256
+      max_chunk = tiled ? n : attn_chunk_tokens(total_len)
       # The split path's workspace scales with chunk * splits, so cap the chunk to keep it inside a
       # fixed budget. Without this the workspace grows with context and no reserve is ever enough.
-      if cap = split_attn_chunk_cap(total_len)
+      if !tiled && (cap = split_attn_chunk_cap(total_len))
         max_chunk = cap if cap < max_chunk
       end
       max_chunk = n if n < max_chunk
@@ -830,8 +837,10 @@ module SHAInet
       # (heads * tokens * total_len), which at 24 heads, a 256-token chunk and 16k of context is
       # ~203 MB rather than ~384 MB -- and the score row was the largest single allocation in the
       # process, the one that OOM'd a 16 GB card at 9.5k tokens.
-      ws_floats = attn_ws_floats(max_chunk, total_len)
-      @@gpu_attn_ws, @@gpu_attn_ws_cap = grow_dev_buf(@@gpu_attn_ws, @@gpu_attn_ws_cap, ws_floats)
+      unless tiled
+        ws_floats = attn_ws_floats(max_chunk, total_len)
+        @@gpu_attn_ws, @@gpu_attn_ws_cap = grow_dev_buf(@@gpu_attn_ws, @@gpu_attn_ws_cap, ws_floats)
+      end
       ensure_gpu_cache!(total_len, max_chunk)
 
       aqp = aq.device_ptr.not_nil!
@@ -1715,6 +1724,13 @@ module SHAInet
         return if CUDA.attention_prefill(suffix, q, @gpu_k_cache, @gpu_v_cache, @@gpu_attn_out,
                     n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
       end
+
+      # The kernels below need a workspace; the tiled one does not, so prefill no longer sizes it up
+      # front (see attention_prefill_device_core). Guarantee it here instead, which costs a compare
+      # when it is already large enough and keeps a declined tiled call from overrunning a buffer
+      # sized for a different path.
+      @@gpu_attn_ws, @@gpu_attn_ws_cap = grow_dev_buf(@@gpu_attn_ws, @@gpu_attn_ws_cap,
+        attn_ws_floats(n, base_pos + n))
       if use_split_attn?
         ok = case kv_dtype
              in .fp8?
