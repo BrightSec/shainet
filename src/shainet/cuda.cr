@@ -438,6 +438,22 @@ module SHAInet
       @@mmq_decode_proc.not_nil!.call(ggml_type, w, wq, ws, wo, row0, rows, k) != 0
     end
 
+    @@mmq_s16_proc : Proc(Pointer(Int8), Pointer(Float32), Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32)?
+    @@mmq_s16_checked = false
+
+    # mmq_gemm for weights with one scale per 16 values (IQ2 types). False when the kernel is missing.
+    def mmq_gemm_s16(xq : Pointer(Int8), xs : Pointer(Float32), xsum : Pointer(Float32), wq : Pointer(Int8),
+                     ws : Pointer(Float32), y : Pointer(Float32), m : Int32, rows : Int32, k : Int32, ldy : Int32) : Bool
+      unless @@mmq_s16_checked
+        @@mmq_s16_checked = true
+        @@mmq_s16_proc = load_kernel_proc("mmq_gemm_s16",
+          Proc(Pointer(Int8), Pointer(Float32), Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32))
+      end
+      fn = @@mmq_s16_proc
+      return false unless fn
+      fn.call(xq, xs, xsum, wq, ws, y, m, rows, k, ldy) != 0
+    end
+
     def mmq_gemm(offset : Bool, xq : Pointer(Int8), xs : Pointer(Float32), xsum : Pointer(Float32),
                  wq : Pointer(Int8), ws : Pointer(Float32), wo : Pointer(Float32), y : Pointer(Float32),
                  m : Int32, rows : Int32, k : Int32, ldy : Int32) : Bool

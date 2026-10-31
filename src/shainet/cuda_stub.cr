@@ -196,6 +196,10 @@ module SHAInet
       false
     end
 
+    def mmq_gemm_s16(*args) : Bool
+      false
+    end
+
     def mmq_gemm(*args) : Bool
       false
     end

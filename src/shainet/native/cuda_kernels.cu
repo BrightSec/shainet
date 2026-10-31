@@ -4426,6 +4426,11 @@ extern "C++" {
 #define MMQ_TYPE_IQ4XS 1
 #define MMQ_TYPE_IQ3S 2
 #define MMQ_TYPE_IQ3XXS 3
+// Types whose weight scale covers 16 values rather than 32 (two m16n8k16 MMAs per 32-wide k step).
+#define MMQ_TYPE_IQ2XXS 4
+#define MMQ_TYPE_IQ2XS 5
+#define MMQ_TYPE_IQ2S 6
+#define MMQ_S16(T) ((T) >= MMQ_TYPE_IQ2XXS)
 
 // One warp per (row, 32-value block): scale = max|x| / 127, q = round(x / scale), plus the float sum.
 __global__ void mmq_quantize_x_kernel(const float* __restrict__ x, signed char* __restrict__ xq,
@@ -4488,11 +4493,53 @@ __device__ __forceinline__ unsigned int mmq_pack4(int a, int b, int c, int d) {
 
 // Decode one 256-value GGUF block of one weight row into `wq` (256 int8), `ws` (8 scales) and `wo`
 // (8 offsets), one warp, lane-parallel. The lane mappings are the GEMV kernels'.
+//
+// The IQ2 types write 16 scales per block (one per 16 values) and no offsets.
 template <int TYPE>
 __device__ __forceinline__ void mmq_decode_block(const unsigned char* __restrict__ block, int lane,
                                                  signed char* wq, float* ws, float* wo,
                                                  const unsigned int* s_grid,
-                                                 const unsigned char* s_ksigns) {
+                                                 const unsigned char* s_ksigns,
+                                                 const unsigned long long* s_grid64) {
+    if (MMQ_S16(TYPE)) {
+        const int ib32 = lane >> 2, lpos = lane & 3;
+        const float d = __half2float(*((const __half*)(block + 0)));
+        unsigned long long gq;
+        unsigned int sg;
+        float db;
+        if (TYPE == MMQ_TYPE_IQ2XXS) {
+            const unsigned char* qs = block + 2;
+            const unsigned short* sp = (const unsigned short*)(qs + 8 * ib32 + 4);   // 2-byte aligned
+            const unsigned int aux1 = (unsigned int)sp[0] | ((unsigned int)sp[1] << 16);
+            db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+            sg = s_ksigns[(aux1 >> (7 * lpos)) & 127];
+            gq = s_grid64[qs[8 * ib32 + lpos]];
+        } else if (TYPE == MMQ_TYPE_IQ2XS) {
+            const unsigned short q = ((const unsigned short*)(block + 2))[4 * ib32 + lpos];
+            const unsigned char sc = block[2 + 64 + ib32];
+            db = d * (0.5f + (float)((lpos >> 1) ? (sc >> 4) : (sc & 0xf))) * 0.25f;
+            sg = s_ksigns[q >> 9];
+            gq = s_grid64[q & 511];
+        } else {
+            const unsigned char* qs = block + 2;
+            const unsigned char sc = block[2 + 64 + 8 + ib32];
+            db = d * (0.5f + (float)((lpos >> 1) ? (sc >> 4) : (sc & 0xf))) * 0.25f;
+            const int gi = qs[4 * ib32 + lpos] | (((int)block[2 + 64 + ib32] << (8 - 2 * lpos)) & 0x300);
+            sg = qs[32 + 4 * ib32 + lpos];
+            gq = s_grid64[gi];
+        }
+        int v[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int m = (int)((gq >> (8 * j)) & 0xFFULL);
+            v[j] = (sg & (1u << j)) ? -m : m;
+        }
+        unsigned int* dst = (unsigned int*)(wq + ib32 * 32 + lpos * 8);
+        dst[0] = mmq_pack4(v[0], v[1], v[2], v[3]);
+        dst[1] = mmq_pack4(v[4], v[5], v[6], v[7]);
+        if ((lpos & 1) == 0) ws[ib32 * 2 + (lpos >> 1)] = db;
+        return;
+    }
     if (TYPE == MMQ_TYPE_Q4K) {
         const float d = __half2float(*((const __half*)(block + 0)));
         const float dmin = __half2float(*((const __half*)(block + 2)));
@@ -4595,19 +4642,38 @@ __device__ __forceinline__ void mmq_mma(int* c, const unsigned int* a, const uns
 #define MMQ2_BK 64
 #define MMQ2_LD 80          // 64 bytes + 16 pad: fragment loads hit 32 distinct banks
 
+__device__ __forceinline__ void mmq_mma16(int* c, unsigned int a0, unsigned int a1, unsigned int b0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+#endif
+}
+
 template <int TYPE>
 __global__ void mmq_decode_rows_kernel(const unsigned char* __restrict__ w, signed char* __restrict__ wq,
                                        float* __restrict__ ws, float* __restrict__ wo,
                                        int row0, int rows, int K, int block_bytes) {
     __shared__ unsigned int s_grid[512];
     __shared__ unsigned char s_ksigns[128];
+    __shared__ unsigned long long s_grid64[MMQ_S16(TYPE) ? 1024 : 1];
     if (TYPE == MMQ_TYPE_IQ3S) {
         for (int i = threadIdx.x; i < 512; i += blockDim.x) s_grid[i] = d_iq3s_grid[i];
     } else if (TYPE == MMQ_TYPE_IQ3XXS) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) s_grid[i] = d_iq3xxs_grid[i];
         for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns[i] = d_ksigns_iq2xs[i];
+    } else if (TYPE == MMQ_TYPE_IQ2XXS) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) s_grid64[i] = d_iq2xxs_grid[i];
+        for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns[i] = d_ksigns_iq2xs[i];
+    } else if (TYPE == MMQ_TYPE_IQ2XS) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) s_grid64[i] = d_iq2xs_grid[i];
+        for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns[i] = d_ksigns_iq2xs[i];
+    } else if (TYPE == MMQ_TYPE_IQ2S) {
+        for (int i = threadIdx.x; i < 1024; i += blockDim.x) s_grid64[i] = d_iq2s_grid[i];
     }
     __syncthreads();
+    constexpr int SPB = MMQ_S16(TYPE) ? 16 : 8;   // scales per 256-value block
     const int lane = threadIdx.x & 31;
     const int nblocks = K / 256;
     const long row_bytes = (long)nblocks * block_bytes;
@@ -4616,8 +4682,8 @@ __global__ void mmq_decode_rows_kernel(const unsigned char* __restrict__ w, sign
     for (long it = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); it < items; it += nwarps) {
         const int r = (int)(it / nblocks), b = (int)(it - (long)r * nblocks);
         mmq_decode_block<TYPE>(w + (long)(row0 + r) * row_bytes + (long)b * block_bytes, lane,
-                               wq + (long)r * K + b * 256, ws + (long)r * (K / 32) + b * 8,
-                               wo + (long)r * (K / 32) + b * 8, s_grid, s_ksigns);
+                               wq + (long)r * K + b * 256, ws + (long)r * (K / 256) * SPB + b * SPB,
+                               wo + (long)r * (K / 32) + b * 8, s_grid, s_ksigns, s_grid64);
     }
 }
 
@@ -4635,7 +4701,7 @@ __device__ __forceinline__ void mmq2_commit() { asm volatile("cp.async.commit_gr
 template <int N> __device__ __forceinline__ void mmq2_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
 
 // y[m, n0 + n] for a slice of `rows` weight rows starting at output column n0, ldy = full N.
-template <bool OFFSET, int BM, int BN, int WM_, int WN_, int ST>
+template <bool OFFSET, int BM, int BN, int WM_, int WN_, int ST, bool S16 = false>
 __global__ void __launch_bounds__(WM_ * WN_ * 32) mmq_gemm_kernel(const signed char* __restrict__ xq,
                                                        const float* __restrict__ xs,
                                                        const float* __restrict__ xsum,
@@ -4649,8 +4715,8 @@ __global__ void __launch_bounds__(WM_ * WN_ * 32) mmq_gemm_kernel(const signed c
     signed char* Xs = (signed char*)mmq2_smem;                          // [S][BM][LD]
     signed char* Ws = Xs + ST * BM * MMQ2_LD;             // [S][BN][LD]
     float* sxs = (float*)(Ws + ST * BN * MMQ2_LD);        // [S][BM][2]
-    float* sws = sxs + ST * BM * 2;                        // [S][BN][2]
-    float* sxm = sws + ST * BN * 2;                        // [S][BM][2]
+    float* sws = sxs + ST * BM * 2;                        // [S][BN][4]: 2 per-32 or 4 per-16 scales
+    float* sxm = sws + ST * BN * 4;                        // [S][BM][2]
     float* swo = sxm + ST * BM * 2;                        // [S][BN][2]
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -4679,11 +4745,19 @@ __global__ void __launch_bounds__(WM_ * WN_ * 32) mmq_gemm_kernel(const signed c
             mmq2_cp4(sxs + (stage * BM + r) * 2 + s, xs + (long)(okm ? m0 + r : 0) * nb32 + kb, okm);
             if (OFFSET) mmq2_cp4(sxm + (stage * BM + r) * 2 + s, xsum + (long)(okm ? m0 + r : 0) * nb32 + kb, okm);
         }
-        for (int c = tid; c < BN * 2; c += NTHR) {
-            const int r = c >> 1, s = c & 1, kb = (k0 >> 5) + s;
-            const bool okn = n0 + r < rows;
-            mmq2_cp4(sws + (stage * BN + r) * 2 + s, ws + (long)(okn ? n0 + r : 0) * nb32 + kb, okn);
-            if (OFFSET) mmq2_cp4(swo + (stage * BN + r) * 2 + s, wo + (long)(okn ? n0 + r : 0) * nb32 + kb, okn);
+        if (S16) {
+            for (int c = tid; c < BN * 4; c += NTHR) {
+                const int r = c >> 2, s = c & 3, kb = (k0 >> 4) + s;
+                const bool okn = n0 + r < rows;
+                mmq2_cp4(sws + (stage * BN + r) * 4 + s, ws + (long)(okn ? n0 + r : 0) * (2 * nb32) + kb, okn);
+            }
+        } else {
+            for (int c = tid; c < BN * 2; c += NTHR) {
+                const int r = c >> 1, s = c & 1, kb = (k0 >> 5) + s;
+                const bool okn = n0 + r < rows;
+                mmq2_cp4(sws + (stage * BN + r) * 4 + s, ws + (long)(okn ? n0 + r : 0) * nb32 + kb, okn);
+                if (OFFSET) mmq2_cp4(swo + (stage * BN + r) * 2 + s, wo + (long)(okn ? n0 + r : 0) * nb32 + kb, okn);
+            }
         }
     };
 
@@ -4721,12 +4795,19 @@ __global__ void __launch_bounds__(WM_ * WN_ * 32) mmq_gemm_kernel(const signed c
                 b[nt][0] = *((const unsigned int*)(wr));
                 b[nt][1] = *((const unsigned int*)(wr + 16));
             }
-            float w0[NT], w1[NT], o0[NT], o1[NT];
+            float w0[NT], w1[NT], o0[NT], o1[NT], h0[NT], h1[NT];
             #pragma unroll
             for (int nt = 0; nt < NT; ++nt) {
                 const int wr0 = wn + nt * 8 + t * 2;
-                w0[nt] = sws[(st * BN + wr0) * 2 + s];
-                w1[nt] = sws[(st * BN + wr0 + 1) * 2 + s];
+                if (S16) {   // low and high 16-value halves of this 32-wide step
+                    w0[nt] = sws[(st * BN + wr0) * 4 + 2 * s];
+                    h0[nt] = sws[(st * BN + wr0) * 4 + 2 * s + 1];
+                    w1[nt] = sws[(st * BN + wr0 + 1) * 4 + 2 * s];
+                    h1[nt] = sws[(st * BN + wr0 + 1) * 4 + 2 * s + 1];
+                } else {
+                    w0[nt] = sws[(st * BN + wr0) * 4 + s];
+                    w1[nt] = sws[(st * BN + wr0 + 1) * 4 + s];
+                }
                 if (OFFSET) {
                     o0[nt] = swo[(st * BN + wr0) * 2 + s];
                     o1[nt] = swo[(st * BN + wr0 + 1) * 2 + s];
@@ -4750,6 +4831,21 @@ __global__ void __launch_bounds__(WM_ * WN_ * 32) mmq_gemm_kernel(const signed c
                 }
                 // All four MMAs first, scaling after: each result is otherwise consumed the moment
                 // it is produced, which exposes the full MMA latency with only 8 warps per SM.
+                if (S16) {
+                    // The k32 fragments split exactly into two m16n8k16 halves: (a0, a1, b0) covers
+                    // k 0-15 and (a2, a3, b1) k 16-31, each with its own weight scale.
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
+                        mmq_mma16(lo, a[0], a[1], b[nt][0]);
+                        mmq_mma16(hi, a[2], a[3], b[nt][1]);
+                        acc[mt][nt][0] += x0 * ((float)lo[0] * w0[nt] + (float)hi[0] * h0[nt]);
+                        acc[mt][nt][1] += x0 * ((float)lo[1] * w1[nt] + (float)hi[1] * h1[nt]);
+                        acc[mt][nt][2] += x1 * ((float)lo[2] * w0[nt] + (float)hi[2] * h0[nt]);
+                        acc[mt][nt][3] += x1 * ((float)lo[3] * w1[nt] + (float)hi[3] * h1[nt]);
+                    }
+                    continue;
+                }
                 int cc[NT][4];
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
@@ -4794,7 +4890,8 @@ __global__ void __launch_bounds__(WM_ * WN_ * 32) mmq_gemm_kernel(const signed c
 }
 
 template <int BM, int BN, int ST> static size_t mmq2_smem_bytes() {
-    return (size_t)ST * (BM + BN) * MMQ2_LD + (size_t)ST * (BM + BN) * 2 * 2 * sizeof(float);
+    // int8 tiles, then per stage: xs and xsum (2 per row each), weight scales (4 per row), offsets (2).
+    return (size_t)ST * (BM + BN) * MMQ2_LD + (size_t)ST * (BM * 4 + BN * 6) * sizeof(float);
 }
 
 } // extern "C++"
@@ -4832,6 +4929,9 @@ int mmq_decode_rows(int ggml_type, const unsigned char* w, signed char* wq, floa
     case 23: mmq_decode_rows_kernel<MMQ_TYPE_IQ4XS><<<grid, 256>>>(w, wq, ws, wo, row0, rows, K, 136); return 1;
     case 21: mmq_decode_rows_kernel<MMQ_TYPE_IQ3S><<<grid, 256>>>(w, wq, ws, wo, row0, rows, K, 110); return 1;
     case 18: mmq_decode_rows_kernel<MMQ_TYPE_IQ3XXS><<<grid, 256>>>(w, wq, ws, wo, row0, rows, K, 98); return 1;
+    case 16: mmq_decode_rows_kernel<MMQ_TYPE_IQ2XXS><<<grid, 256>>>(w, wq, ws, wo, row0, rows, K, 66); return 1;
+    case 17: mmq_decode_rows_kernel<MMQ_TYPE_IQ2XS><<<grid, 256>>>(w, wq, ws, wo, row0, rows, K, 74); return 1;
+    case 22: mmq_decode_rows_kernel<MMQ_TYPE_IQ2S><<<grid, 256>>>(w, wq, ws, wo, row0, rows, K, 82); return 1;
     default: return 0;
     }
 }
@@ -4840,7 +4940,7 @@ extern "C++" {
 template <int BM, int BN, int WM_, int WN_, int ST>
 static int mmq_gemm_launch(int offset, const signed char* xq, const float* xs, const float* xsum,
                            const signed char* wq, const float* ws, const float* wo, float* y,
-                           int M, int rows, int K, int ldy) {
+                           int M, int rows, int K, int ldy, bool s16 = false) {
     static int ready = 0;
     const size_t smem = mmq2_smem_bytes<BM, BN, ST>();
     if (ready == 0) {
@@ -4848,13 +4948,17 @@ static int mmq_gemm_launch(int offset, const signed char* xq, const float* xs, c
             cudaFuncSetAttribute(mmq_gemm_kernel<true, BM, BN, WM_, WN_, ST>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) == cudaSuccess &&
             cudaFuncSetAttribute(mmq_gemm_kernel<false, BM, BN, WM_, WN_, ST>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) == cudaSuccess &&
+            cudaFuncSetAttribute(mmq_gemm_kernel<false, BM, BN, WM_, WN_, ST, true>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) == cudaSuccess;
         cudaGetLastError();
         ready = ok ? 1 : -1;
     }
     if (ready < 0) return 0;
     dim3 grid((rows + BN - 1) / BN, (M + BM - 1) / BM);
-    if (offset)
+    if (s16)
+        mmq_gemm_kernel<false, BM, BN, WM_, WN_, ST, true><<<grid, WM_ * WN_ * 32, smem>>>(xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
+    else if (offset)
         mmq_gemm_kernel<true, BM, BN, WM_, WN_, ST><<<grid, WM_ * WN_ * 32, smem>>>(xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
     else
         mmq_gemm_kernel<false, BM, BN, WM_, WN_, ST><<<grid, WM_ * WN_ * 32, smem>>>(xq, xs, xsum, wq, ws, wo, y, M, rows, K, ldy);
@@ -4866,6 +4970,13 @@ static int mmq_gemm_launch(int offset, const signed char* xq, const float* xs, c
     return 1;
 }
 } // extern "C++"
+
+// mmq_gemm for weights decoded with one scale per 16 values (the IQ2 types): ws holds K/16 scales per
+// row and there are no offsets.
+int mmq_gemm_s16(const signed char* xq, const float* xs, const float* xsum, const signed char* wq,
+                 const float* ws, float* y, int M, int rows, int K, int ldy) {
+    return mmq_gemm_launch<128, 128, 2, 4, 2>(0, xq, xs, xsum, wq, ws, ws, y, M, rows, K, ldy, true);
+}
 
 // y[m, n] for `rows` weight rows into columns starting at y (leading dimension ldy). `offset` adds the
 // per-block weight offsets (Q4_K). Returns 0 when the shared-memory opt-in was refused.

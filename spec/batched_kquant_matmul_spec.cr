@@ -180,6 +180,55 @@ describe "batched k-quant matmul" do
     w.free!
   end
 
+  # The IQ2 types carry one weight scale per 16 values, so MMQ splits each 32-wide step into two
+  # m16n8k16 MMAs. Random bytes are valid blocks for all three (every grid index is in range); only
+  # the leading fp16 d is pinned so the scale stays sane.
+  {"IQ2_XXS" => {SHAInet::GGUF::GGMLType::IQ2_XXS, 66},
+   "IQ2_XS"  => {SHAInet::GGUF::GGMLType::IQ2_XS, 74},
+   "IQ2_S"   => {SHAInet::GGUF::GGMLType::IQ2_S, 82}}.each do |kind, (type, bs)|
+    it "int8 MMQ GEMM matches the dequant GEMM for #{kind}", tags: "cuda" do
+      pending! "no CUDA" unless SHAInet::CUDA.fully_available?
+      pending! "no int8 MMQ kernels or device below sm_80" unless SHAInet::CUDA.mmq_available?
+
+      k = 512
+      n = 200
+      m = 150
+      nblocks = n * (k // 256)
+      rng = Random.new(1234)
+      host = Pointer(UInt8).malloc(nblocks * bs)
+      (nblocks * bs).times { |i| host[i] = rng.rand(256).to_u8 }
+      nblocks.times { |b| f16((0x2C00 + (b % 64) * 8).to_u16, Bytes.new(host + b * bs, 2), 0) }
+      w = SHAInet::GGUFMatrix.new(k, n, type, host, (nblocks * bs).to_u64)
+
+      x = SHAInet::CudaMatrix.new(m, k)
+      (m * k).times { |i| x.raw_data[i] = (0.5 * Math.sin(i * 0.013) + 0.1 * Math.cos(i * 0.71)).to_f32 }
+      x.mark_host_modified!
+      x.sync_to_device!("spec_in")
+
+      mmq = SHAInet::CudaMatrix.new(m, n)
+      ref = SHAInet::CudaMatrix.new(m, n)
+      begin
+        SHAInet::GGUFMatrix.mmq = true
+        w.gemm_into(x, mmq)
+        SHAInet::GGUFMatrix.mmq = false
+        w.gemm_into(x, ref)
+      ensure
+        SHAInet::GGUFMatrix.mmq = nil
+      end
+      mmq.sync_from_device!("spec_mmq")
+      ref.sync_from_device!("spec_ref")
+
+      scale = (0...(m * n)).max_of { |i| ref.raw_data[i].abs }
+      (m * n).times do |i|
+        ((mmq.raw_data[i] - ref.raw_data[i]).abs / scale).should be < 1e-2
+      end
+
+      {x, mmq, ref}.each(&.free!)
+      w.free!
+      SHAInet::GGUFMatrix.release_scratch!
+    end
+  end
+
   it "fused SwiGLU int8 GEMM matches swiglu_forward then gemm_into", tags: "cuda" do
     pending! "no CUDA" unless SHAInet::CUDA.fully_available?
     pending! "no int8 MMQ kernels or device below sm_80" unless SHAInet::CUDA.mmq_available?

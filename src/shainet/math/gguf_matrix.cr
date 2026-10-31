@@ -367,7 +367,11 @@ module SHAInet
     # 649 and 4096 gave 634 (71 MB at K=17408, past the 64 MB L2). SHAINET_MMQ_SLICE_ROWS overrides.
     MMQ_SLICE_ROWS = (ENV["SHAINET_MMQ_SLICE_ROWS"]?.try(&.to_i?) || 1024)
 
-    MMQ_TYPES = {GGUF::GGMLType::Q4_K, GGUF::GGMLType::IQ4_XS, GGUF::GGMLType::IQ3_S, GGUF::GGMLType::IQ3_XXS}
+    MMQ_TYPES = {GGUF::GGMLType::Q4_K, GGUF::GGMLType::IQ4_XS, GGUF::GGMLType::IQ3_S, GGUF::GGMLType::IQ3_XXS,
+                 GGUF::GGMLType::IQ2_XXS, GGUF::GGMLType::IQ2_XS, GGUF::GGMLType::IQ2_S}
+    # Decoded with one weight scale per 16 values: twice the scales, no offsets.
+    MMQ_S16_TYPES = {GGUF::GGMLType::IQ2_XXS, GGUF::GGMLType::IQ2_XS, GGUF::GGMLType::IQ2_S}
+    MMQ_S16_ON    = ENV.fetch("SHAINET_MMQ_S16", "1") != "0"
 
     def self.mmq? : Bool
       flag = @@mmq
@@ -411,7 +415,7 @@ module SHAInet
       nb = (k // 32).to_i64
       slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
       @@mq_w, @@mq_w_elems = GGUFMatrix.grow(@@mq_w, @@mq_w_elems, slice.to_i64 * k)
-      @@mq_ws, @@mq_ws_elems = GGUFMatrix.grow(@@mq_ws, @@mq_ws_elems, slice.to_i64 * nb)
+      @@mq_ws, @@mq_ws_elems = GGUFMatrix.grow(@@mq_ws, @@mq_ws_elems, slice.to_i64 * nb * 2)
       @@mq_wo, @@mq_wo_elems = GGUFMatrix.grow(@@mq_wo, @@mq_wo_elems, slice.to_i64 * nb)
       @@mq_x, @@mq_x_elems = GGUFMatrix.grow(@@mq_x, @@mq_x_elems, m.to_i64 * k)
       @@mq_xs, @@mq_xs_elems = GGUFMatrix.grow(@@mq_xs, @@mq_xs_elems, m.to_i64 * nb)
@@ -423,14 +427,19 @@ module SHAInet
     private def mmq_run(m : Int32, k : Int32, result : CudaMatrix) : Bool
       rp = result.device_ptr.not_nil!
       offset = @ggml_type.q4_k?
+      s16 = MMQ_S16_TYPES.includes?(@ggml_type)
       slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
       row0 = 0
       while row0 < @cols
         rows = @cols - row0
         rows = slice if rows > slice
         return false unless CUDA.mmq_decode_rows(@ggml_type.value.to_i32, @dev_ptr, @@mq_w, @@mq_ws, @@mq_wo, row0, rows, k)
-        return false unless CUDA.mmq_gemm(offset, @@mq_x, @@mq_xs, @@mq_xsum, @@mq_w, @@mq_ws, @@mq_wo,
-                              rp + row0, m, rows, k, @cols)
+        ok = if s16
+               CUDA.mmq_gemm_s16(@@mq_x, @@mq_xs, @@mq_xsum, @@mq_w, @@mq_ws, rp + row0, m, rows, k, @cols)
+             else
+               CUDA.mmq_gemm(offset, @@mq_x, @@mq_xs, @@mq_xsum, @@mq_w, @@mq_ws, @@mq_wo, rp + row0, m, rows, k, @cols)
+             end
+        return false unless ok
         row0 += rows
       end
       result.mark_device_dirty!
@@ -439,6 +448,7 @@ module SHAInet
 
     private def gemm_into_mmq(x : CudaMatrix, result : CudaMatrix) : Bool
       return false unless MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
+      return false if MMQ_S16_TYPES.includes?(@ggml_type) && !MMQ_S16_ON
       k = @rows
       m = x.rows
       return false unless mmq_buffers(m, k)
@@ -459,6 +469,7 @@ module SHAInet
     # cannot take the int8 path; the caller then runs swiglu_forward and gemm_into as before.
     def gemm_into_swiglu(gate : CudaMatrix, up : CudaMatrix, result : CudaMatrix) : Bool
       return false unless gate.rows > 1 && MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
+      return false if MMQ_S16_TYPES.includes?(@ggml_type) && !MMQ_S16_ON
       k = @rows
       m = gate.rows
       return false unless gate.cols == k && up.cols == k && up.rows == m
