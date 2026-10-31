@@ -43,6 +43,20 @@ def gdev_scale(m : SHAInet::SimpleMatrix) : Float64
 end
 
 describe "GatedDeltaNetBlock device recurrence" do
+  it "matches the host recurrence at a shape the column-parallel kernel serves" do
+    pending! "requires the gated_delta_rule kernel" unless SHAInet::CUDA.gated_delta_rule_available?
+    # head_v 32 (a multiple of the kernel's 32-column slice) and head_k 32. The default block above
+    # uses head_v 8, which that kernel declines, so only this case covers it.
+    x = gdev_fill!(SHAInet::SimpleMatrix.new(9, 32), 32)
+
+    ENV["SHAINET_GDN_DEVICE"] = "0"
+    host = gdev_block(nv: 4, nk: 2, hk: 32, hv: 32).forward(x)
+    ENV.delete("SHAINET_GDN_DEVICE")
+    dev = gdev_block(nv: 4, nk: 2, hk: 32, hv: 32).forward(x)
+
+    (gdev_worst(dev, host) / gdev_scale(host)).should be < 1e-4
+  end
+
   it "matches the host recurrence over a whole sequence" do
     pending! "requires the gated_delta_rule kernel" unless SHAInet::CUDA.gated_delta_rule_available?
     x = gdev_fill!(SHAInet::SimpleMatrix.new(9, 32), 30)

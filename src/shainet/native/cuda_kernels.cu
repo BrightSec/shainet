@@ -2371,12 +2371,146 @@ __global__ void gated_delta_rule_kernel(
     }
 }
 
+// The same recurrence, column-parallel with the state in REGISTERS.
+//
+// The kernel above runs one block per value head -- 48 blocks on a 76-SM card -- and walks its 64 KB
+// shared-memory state four times per token, with about twenty __syncthreads and two halving
+// reductions in between. Measured: 2.6 ms per 256-token chunk, ~21% of a prefill, and ~40 us per
+// layer per decode token.
+//
+// But the state's value columns never interact: column c is decayed, read with k, corrected by
+// v[c], and read with q, all on its own. So a block here owns 32 columns of one head (grid nv x
+// dv/32), and each column is split across 4 lanes of the same warp, each holding dk/4 rows of it
+// in registers. Readouts reduce with two shuffles; the only block-wide step is staging q and k,
+// double-buffered so it costs one __syncthreads per token. Norms are recomputed per warp, which is
+// cheaper than synchronizing to share them.
+//
+// Mathematically identical to the kernel above; summation order differs, so results agree to fp32
+// rounding rather than bit for bit.
+#define GDR_COLS 32         // value columns per block: 4 warps x 8 columns
+#define GDR_GROUPS 4        // lanes (row groups) per column
+#define GDR_MAX_ROWS 32     // rows per lane, so dk <= 128
+
+__global__ void gated_delta_rule_cols_kernel(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ alpha, const float* __restrict__ beta,
+    float* __restrict__ state, float* __restrict__ out,
+    int seq, int nv, int nk, int dk, int dv, int heads_per_k, float q_scale, int k_head_tiled)
+{
+    // Padded by one per group so the four groups' lanes read four different banks.
+    __shared__ float qs[2][GDR_GROUPS * (GDR_MAX_ROWS + 1)];
+    __shared__ float ks[2][GDR_GROUPS * (GDR_MAX_ROWS + 1)];
+    const int h = blockIdx.x;
+    const int kh = k_head_tiled ? (h % nk) : (h / heads_per_k);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane & 3;
+    const int c = blockIdx.y * GDR_COLS + warp * 8 + (lane >> 2);
+    const int rpg = dk / GDR_GROUPS;
+    const int pad = rpg + 1;
+
+    const size_t sbase = (size_t)h * dk * dv;
+    float S[GDR_MAX_ROWS];
+    #pragma unroll
+    for (int r = 0; r < GDR_MAX_ROWS; ++r)
+        S[r] = (r < rpg) ? state[sbase + (size_t)(g * rpg + r) * dv + c] : 0.0f;
+
+    const size_t kstride = (size_t)nk * dk;
+    const size_t vstride = (size_t)nv * dv;
+
+    for (int t = 0; t < seq; ++t) {
+        const int buf = t & 1;
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            const int gi = i / rpg, ri = i - gi * rpg;
+            qs[buf][gi * pad + ri] = q[(size_t)t * kstride + (size_t)kh * dk + i];
+            ks[buf][gi * pad + ri] = k[(size_t)t * kstride + (size_t)kh * dk + i];
+        }
+        __syncthreads();
+
+        float lq = 0.0f, lk = 0.0f;
+        for (int i = lane; i < dk; i += 32) {
+            const int gi = i / rpg, ri = i - gi * rpg;
+            const float a = qs[buf][gi * pad + ri], b = ks[buf][gi * pad + ri];
+            lq += a * a;
+            lk += b * b;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            lq += __shfl_xor_sync(0xFFFFFFFF, lq, o);
+            lk += __shfl_xor_sync(0xFFFFFFFF, lk, o);
+        }
+        const float nq = rsqrtf(fmaxf(lq, 1e-12f)) * q_scale;
+        const float nkk = rsqrtf(fmaxf(lk, 1e-12f));
+        const float a = alpha[(size_t)t * nv + h];
+        const float b = beta[(size_t)t * nv + h];
+        const float* qg = &qs[buf][g * pad];
+        const float* kg = &ks[buf][g * pad];
+
+        // Decay, then read out with the normalized k (the reference reads the DECAYED state).
+        float kv = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < GDR_MAX_ROWS; ++r) {
+            if (r < rpg) {
+                S[r] *= a;
+                kv += S[r] * kg[r];
+            }
+        }
+        kv *= nkk;
+        kv += __shfl_xor_sync(0xFFFFFFFF, kv, 1);
+        kv += __shfl_xor_sync(0xFFFFFFFF, kv, 2);
+
+        // S += k (x) beta*(v - kv_mem), then out = q^T S.
+        const float delta = (v[(size_t)t * vstride + (size_t)h * dv + c] - kv) * b * nkk;
+        float o = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < GDR_MAX_ROWS; ++r) {
+            if (r < rpg) {
+                S[r] += kg[r] * delta;
+                o += S[r] * qg[r];
+            }
+        }
+        o *= nq;
+        o += __shfl_xor_sync(0xFFFFFFFF, o, 1);
+        o += __shfl_xor_sync(0xFFFFFFFF, o, 2);
+        if (g == 0) out[(size_t)t * vstride + (size_t)h * dv + c] = o;
+    }
+
+    #pragma unroll
+    for (int r = 0; r < GDR_MAX_ROWS; ++r)
+        if (r < rpg) state[sbase + (size_t)(g * rpg + r) * dv + c] = S[r];
+}
+
+// 1 when the column-parallel kernel ran; 0 for shapes it does not cover (dv not a multiple of 32,
+// dk not a multiple of 4 or above 128) or when SHAINET_GDR_COLS=0, leaving the per-head kernel.
+static int gated_delta_rule_cols(const float* q, const float* k, const float* v,
+                                 const float* alpha, const float* beta,
+                                 float* state, float* out,
+                                 int seq, int nv, int nk, int dk, int dv, int heads_per_k,
+                                 float q_scale, int k_head_tiled) {
+    static const bool enabled = [] {
+        const char* e = getenv("SHAINET_GDR_COLS");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || dv % GDR_COLS != 0 || dk % GDR_GROUPS != 0 || dk / GDR_GROUPS > GDR_MAX_ROWS) return 0;
+    dim3 grid(nv, dv / GDR_COLS);
+    gated_delta_rule_cols_kernel<<<grid, 128>>>(q, k, v, alpha, beta, state, out, seq, nv, nk, dk,
+                                                dv, heads_per_k, q_scale, k_head_tiled);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in gated_delta_rule_cols: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+
 void gated_delta_rule(const float* q, const float* k, const float* v,
                       const float* alpha, const float* beta,
                       float* state, float* out,
                       int seq, int nv, int nk, int dk, int dv, int heads_per_k, float q_scale,
                       int k_head_tiled) {
     if (seq <= 0 || nv <= 0) return;
+    if (gated_delta_rule_cols(q, k, v, alpha, beta, state, out, seq, nv, nk, dk, dv, heads_per_k,
+                              q_scale, k_head_tiled)) return;
     int threads = 128;
     if (dv < threads) threads = dv < 32 ? 32 : dv;
     // Round to a power of two: the reduction loop halves nthr.
