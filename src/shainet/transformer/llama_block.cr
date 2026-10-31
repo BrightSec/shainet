@@ -434,9 +434,11 @@ module SHAInet
       ao = (@dev_attn_out ||= CudaMatrix.new(1, @q_dim))
 
       Profile.measure("attn.dev_qkv") do
-        @w_q.as(QuantizedWeight).gemv_into(x, qd)
-        @w_k.as(QuantizedWeight).gemv_into(x, kd)
-        @w_v.as(QuantizedWeight).gemv_into(x, vd)
+        GGUFMatrix.with_shared_input(x) do
+          @w_q.as(QuantizedWeight).gemv_into(x, qd)
+          @w_k.as(QuantizedWeight).gemv_into(x, kd)
+          @w_v.as(QuantizedWeight).gemv_into(x, vd)
+        end
       end
 
       Profile.measure("attn.dev_prep") do
@@ -769,9 +771,11 @@ module SHAInet
       vd = attn_ws(@@attn_ws_v, n, kv_dim)
 
       Profile.measure("attn.dev_qkv") do
-        wq.gemv_into(xd, qd)
-        wk.gemv_into(xd, kd)
-        wv.gemv_into(xd, vd)
+        GGUFMatrix.with_shared_input(xd) do
+          wq.gemv_into(xd, qd)
+          wk.gemv_into(xd, kd)
+          wv.gemv_into(xd, vd)
+        end
       end
 
       Profile.measure("attn.dev_prep") do

@@ -129,8 +129,15 @@ module SHAInet
       hidden_buf = SwiGLUFF.batch_buf(@@dev_hidden_batch, n, hidden_cols)
 
       Profile.measure("ffn.batch_gate_up") do
-        gate_w.gemv_into(xb, gate_buf)
-        up_w.gemv_into(xb, up_buf)
+        GGUFMatrix.with_shared_input(xb) do
+          gate_w.gemv_into(xb, gate_buf)
+          up_w.gemv_into(xb, up_buf)
+        end
+      end
+      # The int8 path computes silu(gate) * up inside the down projection's input quantization, so
+      # the [n, hidden] activation is never written out and read back.
+      if down_w.is_a?(GGUFMatrix) && Profile.measure("ffn.batch_down") { down_w.gemm_into_swiglu(gate_buf, up_buf, out_buf) }
+        return out_buf
       end
       Profile.measure("ffn.batch_swiglu") do
         # Elementwise over the whole batch: the buffers are contiguous [n, hidden].

@@ -382,10 +382,32 @@ module SHAInet
       @@mmq = value
     end
 
-    private def gemm_into_mmq(x : CudaMatrix, result : CudaMatrix) : Bool
-      return false unless MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
-      k = @rows
-      m = x.rows
+    # One int8 quantization of an input, shared by the GEMMs that read it.
+    #
+    # A block's projections mostly come in groups over the same activation -- q, k, v and the gate of
+    # a Gated DeltaNet mixer, gate and up of a SwiGLU -- and each gemm_into quantized it again: ~0.8 s
+    # of a 17.7K-token prefill on the 27B. Inside with_shared_input(x) the first int8 GEMM on x
+    # quantizes it and the rest reuse the result. Scoped to the block on purpose: activation buffers
+    # are recycled, so a pointer alone does not prove the contents are the ones that were quantized.
+    @@shared_src : Pointer(Float32) = Pointer(Float32).null
+    @@shared_ready = false
+    @@shared_rows = 0
+    @@shared_k = 0
+
+    def self.with_shared_input(x : CudaMatrix, &)
+      prev = @@shared_src
+      @@shared_src = x.device_ptr || Pointer(Float32).null
+      @@shared_ready = false
+      begin
+        yield
+      ensure
+        @@shared_src = prev
+        @@shared_ready = false
+      end
+    end
+
+    # Grow the int8 scratch for an [m, k] input and a slice of this weight. False on allocation failure.
+    private def mmq_buffers(m : Int32, k : Int32) : Bool
       nb = (k // 32).to_i64
       slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
       @@mq_w, @@mq_w_elems = GGUFMatrix.grow(@@mq_w, @@mq_w_elems, slice.to_i64 * k)
@@ -394,11 +416,14 @@ module SHAInet
       @@mq_x, @@mq_x_elems = GGUFMatrix.grow(@@mq_x, @@mq_x_elems, m.to_i64 * k)
       @@mq_xs, @@mq_xs_elems = GGUFMatrix.grow(@@mq_xs, @@mq_xs_elems, m.to_i64 * nb)
       @@mq_xsum, @@mq_xsum_elems = GGUFMatrix.grow(@@mq_xsum, @@mq_xsum_elems, m.to_i64 * nb)
-      return false if @@mq_w.null? || @@mq_ws.null? || @@mq_wo.null? || @@mq_x.null? || @@mq_xs.null? || @@mq_xsum.null?
+      !(@@mq_w.null? || @@mq_ws.null? || @@mq_wo.null? || @@mq_x.null? || @@mq_xs.null? || @@mq_xsum.null?)
+    end
 
-      CUDA.mmq_quantize_x(x.device_ptr.not_nil!, @@mq_x, @@mq_xs, @@mq_xsum, m, k)
+    # Decode + GEMM over the weight's row slices, from the int8 activations already in the scratch.
+    private def mmq_run(m : Int32, k : Int32, result : CudaMatrix) : Bool
       rp = result.device_ptr.not_nil!
       offset = @ggml_type.q4_k?
+      slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
       row0 = 0
       while row0 < @cols
         rows = @cols - row0
@@ -410,6 +435,38 @@ module SHAInet
       end
       result.mark_device_dirty!
       true
+    end
+
+    private def gemm_into_mmq(x : CudaMatrix, result : CudaMatrix) : Bool
+      return false unless MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
+      k = @rows
+      m = x.rows
+      return false unless mmq_buffers(m, k)
+
+      xp = x.device_ptr.not_nil!
+      shared = !@@shared_src.null? && @@shared_src == xp
+      unless shared && @@shared_ready && @@shared_rows == m && @@shared_k == k
+        CUDA.mmq_quantize_x(xp, @@mq_x, @@mq_xs, @@mq_xsum, m, k)
+        @@shared_ready = shared
+        @@shared_rows = m
+        @@shared_k = k
+      end
+      mmq_run(m, k, result)
+    end
+
+    # result = (silu(gate) * up) * W^T, with the SwiGLU computed inside the int8 quantization so the
+    # [m, ff] hidden activation is never materialized. False when this weight or the loaded kernels
+    # cannot take the int8 path; the caller then runs swiglu_forward and gemm_into as before.
+    def gemm_into_swiglu(gate : CudaMatrix, up : CudaMatrix, result : CudaMatrix) : Bool
+      return false unless gate.rows > 1 && MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
+      k = @rows
+      m = gate.rows
+      return false unless gate.cols == k && up.cols == k && up.rows == m
+      return false unless mmq_buffers(m, k)
+      return false unless CUDA.mmq_quantize_swiglu(gate.device_ptr.not_nil!, up.device_ptr.not_nil!,
+                            @@mq_x, @@mq_xs, @@mq_xsum, m, k)
+      @@shared_ready = false   # the scratch now holds this input, not the shared one
+      mmq_run(m, k, result)
     end
 
     # ── fp16 tensor-core prefill GEMM ──

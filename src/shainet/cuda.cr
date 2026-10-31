@@ -409,6 +409,23 @@ module SHAInet
       @@mmq_ok
     end
 
+    @@mmq_swiglu_proc : Proc(Pointer(Float32), Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Nil)?
+    @@mmq_swiglu_checked = false
+
+    # mmq_quantize_x of silu(gate) * up, computed on the way. False when the kernel is missing.
+    def mmq_quantize_swiglu(gate : Pointer(Float32), up : Pointer(Float32), xq : Pointer(Int8),
+                            xs : Pointer(Float32), xsum : Pointer(Float32), m : Int32, k : Int32) : Bool
+      unless @@mmq_swiglu_checked
+        @@mmq_swiglu_checked = true
+        @@mmq_swiglu_proc = load_kernel_proc("mmq_quantize_swiglu",
+          Proc(Pointer(Float32), Pointer(Float32), Pointer(Int8), Pointer(Float32), Pointer(Float32), Int32, Int32, Nil))
+      end
+      fn = @@mmq_swiglu_proc
+      return false unless fn
+      fn.call(gate, up, xq, xs, xsum, m, k)
+      true
+    end
+
     # Activations [m, k] to int8 per 32-value block: values, scales and float block sums.
     def mmq_quantize_x(x : Pointer(Float32), xq : Pointer(Int8), xs : Pointer(Float32), xsum : Pointer(Float32), m : Int32, k : Int32)
       @@mmq_quantize_proc.not_nil!.call(x, xq, xs, xsum, m, k)

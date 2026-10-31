@@ -179,4 +179,55 @@ describe "batched k-quant matmul" do
     gemv.free!
     w.free!
   end
+
+  it "fused SwiGLU int8 GEMM matches swiglu_forward then gemm_into", tags: "cuda" do
+    pending! "no CUDA" unless SHAInet::CUDA.fully_available?
+    pending! "no int8 MMQ kernels or device below sm_80" unless SHAInet::CUDA.mmq_available?
+
+    k = 512
+    n = 160
+    m = 70
+    block = build_q4k_block
+    blocks_per_row = k // 256
+    host = Pointer(UInt8).malloc(n * blocks_per_row * 144)
+    (n * blocks_per_row).times do |b|
+      block.each_with_index { |byte, i| host[b * 144 + i] = i >= 16 ? (byte ^ (b % 9)).to_u8 : byte }
+    end
+    w = SHAInet::GGUFMatrix.new(k, n, SHAInet::GGUF::GGMLType::Q4_K, host, (n * blocks_per_row * 144).to_u64)
+
+    gate = SHAInet::CudaMatrix.new(m, k)
+    up = SHAInet::CudaMatrix.new(m, k)
+    (m * k).times do |i|
+      gate.raw_data[i] = (1.5 * Math.sin(i * 0.017)).to_f32
+      up.raw_data[i] = (0.8 * Math.cos(i * 0.029)).to_f32
+    end
+    gate.mark_host_modified!
+    up.mark_host_modified!
+    gate.sync_to_device!("spec_gate")
+    up.sync_to_device!("spec_up")
+
+    fused = SHAInet::CudaMatrix.new(m, n)
+    hidden = SHAInet::CudaMatrix.new(m, k)
+    plain = SHAInet::CudaMatrix.new(m, n)
+    SHAInet::GGUFMatrix.mmq = true
+    begin
+      w.gemm_into_swiglu(gate, up, fused).should be_true
+      SHAInet::CUDA.swiglu_forward(hidden.device_ptr.not_nil!, gate.device_ptr.not_nil!, up.device_ptr.not_nil!, m * k)
+      hidden.mark_device_dirty!
+      w.gemm_into(hidden, plain)
+    ensure
+      SHAInet::GGUFMatrix.mmq = nil
+    end
+    fused.sync_from_device!("spec_fused")
+    plain.sync_from_device!("spec_plain")
+
+    # Same activation values reach the same quantizer, so the two agree to rounding.
+    scale = (0...(m * n)).max_of { |i| plain.raw_data[i].abs }
+    (m * n).times do |i|
+      ((fused.raw_data[i] - plain.raw_data[i]).abs / scale).should be < 1e-5
+    end
+
+    {gate, up, fused, hidden, plain}.each(&.free!)
+    w.free!
+  end
 end

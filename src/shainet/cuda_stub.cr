@@ -188,6 +188,10 @@ module SHAInet
       raise "CUDA disabled"
     end
 
+    def mmq_quantize_swiglu(*args) : Bool
+      false
+    end
+
     def mmq_decode_rows(*args) : Bool
       false
     end

@@ -4446,6 +4446,35 @@ __global__ void mmq_quantize_x_kernel(const float* __restrict__ x, signed char* 
     }
 }
 
+// mmq_quantize_x for the down projection's input, computing it on the way: v = silu(gate) * up in
+// exactly swiglu_forward_kernel's arithmetic. The [M, ff] hidden activation is never written or read
+// back -- at a 1024-token chunk of the 27B that is 71 MB each way, per layer.
+__global__ void mmq_quantize_swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                           signed char* __restrict__ xq, float* __restrict__ xs,
+                                           float* __restrict__ xsum, int M, int K) {
+    const long wid = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nb = K >> 5;
+    if (wid >= (long)M * nb) return;
+    const int r = (int)(wid / nb), b = (int)(wid - (long)r * nb);
+    const long i = (long)r * K + b * 32 + lane;
+    const float g = gate[i];
+    const float v = (g / (1.0f + expf(-g))) * up[i];
+    float a = fabsf(v), s = v;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, o));
+        s += __shfl_xor_sync(0xFFFFFFFF, s, o);
+    }
+    const float scale = a / 127.0f;
+    const int q = scale > 0.0f ? __float2int_rn(v / scale) : 0;
+    xq[i] = (signed char)q;
+    if (lane == 0) {
+        xs[(long)r * nb + b] = scale;
+        xsum[(long)r * nb + b] = s;
+    }
+}
+
 __device__ __forceinline__ unsigned int mmq_pack4(int a, int b, int c, int d) {
     return (unsigned int)(a & 0xFF) | ((unsigned int)(b & 0xFF) << 8) |
            ((unsigned int)(c & 0xFF) << 16) | ((unsigned int)(d & 0xFF) << 24);
@@ -4779,6 +4808,12 @@ int mmq_available() {
 void mmq_quantize_x(const float* x, signed char* xq, float* xs, float* xsum, int M, int K) {
     const long warps = (long)M * (K / 32);
     mmq_quantize_x_kernel<<<(unsigned int)((warps * 32 + 255) / 256), 256>>>(x, xq, xs, xsum, M, K);
+}
+
+void mmq_quantize_swiglu(const float* gate, const float* up, signed char* xq, float* xs, float* xsum,
+                         int M, int K) {
+    const long warps = (long)M * (K / 32);
+    mmq_quantize_swiglu_kernel<<<(unsigned int)((warps * 32 + 255) / 256), 256>>>(gate, up, xq, xs, xsum, M, K);
 }
 
 // `ggml_type` is the GGUF type id. Returns 0 for a type this path does not decode.

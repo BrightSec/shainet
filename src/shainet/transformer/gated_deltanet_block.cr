@@ -289,9 +289,16 @@ module SHAInet
       qd = resident_buf(:q, seq, k_dim)
       kd = resident_buf(:k, seq, k_dim)
       vd = resident_buf(:v, seq, v_dim)
-      wq.gemv_into(xd, qd)
-      wk.gemv_into(xd, kd)
-      wv.gemv_into(xd, vd)
+      gd = resident_buf(:gd, seq, v_dim)
+      # All four projections read xd, so they share one int8 quantization of it. The output gate
+      # (gd) is only consumed at the end of the mixer, but computing it here is the same product
+      # into its own buffer, and it lets the share cover four GEMMs instead of three.
+      GGUFMatrix.with_shared_input(xd) do
+        wq.gemv_into(xd, qd)
+        wk.gemv_into(xd, kd)
+        wv.gemv_into(xd, vd)
+        wg.gemv_into(xd, gd)
+      end
 
       qc = resident_buf(:qc, seq, k_dim)
       kc = resident_buf(:kc, seq, k_dim)
@@ -359,8 +366,6 @@ module SHAInet
       CUDA.head_rmsnorm_rows(od.device_ptr.not_nil!, ssm_gamma_dev, seq, @num_v_heads,
         @head_v, @eps.to_f32)
 
-      gd = resident_buf(:gd, seq, v_dim)
-      wg.gemv_into(xd, gd)
       # swiglu_forward(dst, gate, up) = silu(gate) * up, which is the output gate exactly.
       gated = resident_buf(:gated, seq, v_dim)
       CUDA.swiglu_forward(gated.device_ptr.not_nil!, gd.device_ptr.not_nil!,
