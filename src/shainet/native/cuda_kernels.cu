@@ -3703,7 +3703,13 @@ __global__ void short_conv_silu3_kernel(float* __restrict__ d0, const float* __r
         dst = d2; src = s2; state = st2; w = w2; channels = ch2; c = g - ch0 - ch1;
     }
 
-    for (int t = 0; t < seq; ++t) {
+    // One token per blockIdx.y. Each (token, channel) output is independent -- the state roll that
+    // carries positions across calls is a separate kernel -- so the sequence is a grid dimension
+    // rather than a loop. Walking it serially in each thread took ~770 us per 1024-token chunk on
+    // the 27B, ~110 GB/s on a memory-bound op. Same arithmetic in the same order, so the output is
+    // unchanged.
+    {
+        const int t = blockIdx.y;
         float acc = 0.0f;
         for (int j = 0; j < kernel; ++j) {
             int back = t - j;
@@ -3991,7 +3997,7 @@ void short_conv_silu3(float* d0, const float* s0, float* st0, const float* w0,
     if (total <= 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    short_conv_silu3_kernel<<<blocks, threads>>>(d0, s0, st0, w0,
+    short_conv_silu3_kernel<<<dim3(blocks, seq), threads>>>(d0, s0, st0, w0,
                                                 d1, s1, st1, w1,
                                                 d2, s2, st2, w2,
                                                 seq, ch0, ch1, ch2, kernel, apply_silu);
