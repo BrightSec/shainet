@@ -159,6 +159,13 @@ module SHAInet
       false
     end
 
+    def attention_prefill(suffix : String, q : Pointer(Float32), kc : Pointer(Void), vc : Pointer(Void),
+                          out_ptr : Pointer(Float32), new_tokens : Int32, start_pos : Int32,
+                          num_heads : Int32, heads_per_kv : Int32, head_dim : Int32,
+                          capacity : Int32, scale : Float32) : Bool
+      false
+    end
+
     def swiglu_forward(*args)
       raise "CUDA disabled"
     end

@@ -1676,6 +1676,13 @@ module SHAInet
 
     @@use_split_attn : Bool? = nil
 
+    # SHAINET_TILED_PREFILL_ATTN=0 keeps prefill on the split-KV kernel, for A/B comparison.
+    @@use_tiled_prefill_attn : Bool = ENV.fetch("SHAINET_TILED_PREFILL_ATTN", "1") != "0"
+
+    private def use_tiled_prefill_attn? : Bool
+      @@use_tiled_prefill_attn
+    end
+
     # Floats the attention workspace needs for the chosen path.
     private def attn_ws_floats(tokens : Int32, total_len : Int32) : Int32
       if use_split_attn?
@@ -1696,6 +1703,18 @@ module SHAInet
     # attention layers that is ~104 ms of per-token attention at 14k becoming ~15 ms.
     private def attend_kv(q : Pointer(Float32), n : Int32, base_pos : Int32,
                           heads_per_kv : Int32, scale : Float32)
+      # Multi-token chunks (prefill) take the tiled kernel: it reads each K/V row once per 16 queries
+      # rather than once per query. It declines shapes it cannot serve, which falls through to the
+      # paths below. Its output lands in @@gpu_attn_out like theirs; it does not use the workspace.
+      if n > 1 && use_tiled_prefill_attn?
+        suffix = case kv_dtype
+                 in .fp8? then "fp8"
+                 in .f16? then "f16"
+                 in .f32? then "f32"
+                 end
+        return if CUDA.attention_prefill(suffix, q, @gpu_k_cache, @gpu_v_cache, @@gpu_attn_out,
+                    n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
+      end
       if use_split_attn?
         ok = case kv_dtype
              in .fp8?

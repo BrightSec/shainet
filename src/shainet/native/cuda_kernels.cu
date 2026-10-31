@@ -1715,6 +1715,185 @@ static void attention_split_kv_launch(const float* q, const KV* kc, const KV* vc
 
 } // extern "C++"
 
+// ---------------------------------------------------------------------------------------------
+// Prefill attention: tiled, flash-attention style.
+//
+// The split-KV kernel above is built for DECODE -- one query row, the key axis split across blocks.
+// Prefill reused it with one block per (head, query token, split), so every query re-read its keys
+// from global memory -- with 24 query heads over 4 KV heads, a 256-token chunk read each K/V row
+// 6 x 256 = 1536 times -- and the dot products ran one thread per key with row-strided loads.
+// Measured on a 3.5K-token prefill of a 27B: 19 ms per call, 5.0 s of a 22.6 s prefill.
+//
+// Here a block owns 16 queries of one head and walks the keys in tiles of 16, staging Q, K and V in
+// shared memory. Scores stay in shared memory, softmax is the online max-rescale (exact, as in the
+// split combine), and causal masking is per (query, key). Each K/V row is read from global memory
+// once per 16 queries instead of once per query.
+//
+// Thread map: 256 threads as 16 rows x 16 lanes. Lane c of row r computes score (r, c) of a tile,
+// then accumulates output dims c, c+16, ... of query r, so a row's softmax statistics are a
+// 16-lane shuffle reduction and the PV reads of V are conflict-free.
+#define PFA_BQ 16
+#define PFA_BK 16
+#define PFA_MAX_DPL 16   // head_dim / 16 output dims per thread; head_dim <= 256
+
+extern "C++" {
+template <typename KV>
+__global__ void attention_prefill_kernel(const float* __restrict__ q,
+                                         const KV* __restrict__ kc,
+                                         const KV* __restrict__ vc,
+                                         float* __restrict__ out,
+                                         int new_tokens, int start_pos,
+                                         int num_heads, int heads_per_kv,
+                                         int head_dim, int capacity, float scale) {
+    extern __shared__ float pfa_smem[];
+    const int hd = head_dim;
+    const int kstride = hd + 1;                 // pad: 16 K rows at the same d hit 16 banks
+    float* Qs = pfa_smem;                       // [BQ][hd]
+    float* Ks = Qs + PFA_BQ * hd;               // [BK][hd+1]
+    float* Vs = Ks + PFA_BK * kstride;          // [BK][hd]
+    float* Ps = Vs + PFA_BK * hd;               // [BQ][BK]
+
+    const int t = threadIdx.x;
+    const int r = t >> 4;                       // query row within the tile
+    const int c = t & 15;                       // key column / output-dim lane
+    const int q0 = blockIdx.x * PFA_BQ;
+    const int h = blockIdx.y;
+    const int kv_h = h / heads_per_kv;
+    const int d_model = num_heads * hd;
+    const int dpl = hd >> 4;
+    const int rows = min(PFA_BQ, new_tokens - q0);
+
+    const KV* kh = kc + (long)kv_h * capacity * hd;
+    const KV* vh = vc + (long)kv_h * capacity * hd;
+
+    for (int idx = t; idx < PFA_BQ * hd; idx += blockDim.x) {
+        const int qi = idx / hd, d = idx - qi * hd;
+        Qs[idx] = (qi < rows) ? q[(long)(q0 + qi) * d_model + (long)h * hd + d] : 0.0f;
+    }
+
+    const bool row_ok = r < rows;
+    const int my_pos = start_pos + q0 + r;      // last key this query may see
+    const int kend = start_pos + q0 + rows;     // keys any query of the tile may see
+
+    float o[PFA_MAX_DPL];
+    #pragma unroll
+    for (int m = 0; m < PFA_MAX_DPL; ++m) o[m] = 0.0f;
+    float m_i = -INFINITY, l_i = 0.0f;
+
+    for (int j0 = 0; j0 < kend; j0 += PFA_BK) {
+        __syncthreads();   // the previous tile's PV reads are done before K/V are overwritten
+        for (int idx = t; idx < PFA_BK * hd; idx += blockDim.x) {
+            const int kj = idx / hd, d = idx - kj * hd;
+            const int j = j0 + kj;
+            const bool ok = j < kend;
+            Ks[kj * kstride + d] = ok ? KVStore<KV>::load(kh, (long)j * hd + d) : 0.0f;
+            Vs[kj * hd + d] = ok ? KVStore<KV>::load(vh, (long)j * hd + d) : 0.0f;
+        }
+        __syncthreads();
+
+        const int j = j0 + c;
+        float s = -INFINITY;
+        if (row_ok && j <= my_pos && j < kend) {
+            const float* qr = Qs + r * hd;
+            const float* kr = Ks + c * kstride;
+            float dot = 0.0f;
+            for (int d = 0; d < hd; ++d) dot += qr[d] * kr[d];
+            s = dot * scale;
+        }
+        float tmax = s;
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1) tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFF, tmax, off, 16));
+        const float m_new = fmaxf(m_i, tmax);
+        float p = 0.0f, alpha = 1.0f;
+        if (m_new != -INFINITY) {
+            p = (s == -INFINITY) ? 0.0f : expf(s - m_new);
+            alpha = (m_i == -INFINITY) ? 0.0f : expf(m_i - m_new);
+        }
+        float tsum = p;
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1) tsum += __shfl_xor_sync(0xFFFFFFFF, tsum, off, 16);
+        l_i = l_i * alpha + tsum;
+        m_i = m_new;
+        Ps[r * PFA_BK + c] = p;
+        #pragma unroll
+        for (int m = 0; m < PFA_MAX_DPL; ++m) o[m] *= alpha;
+        __syncthreads();
+
+        #pragma unroll 4
+        for (int kj = 0; kj < PFA_BK; ++kj) {
+            const float pk = Ps[r * PFA_BK + kj];
+            const float* vr = Vs + kj * hd + c;
+            #pragma unroll
+            for (int m = 0; m < PFA_MAX_DPL; ++m)
+                if (m < dpl) o[m] += pk * vr[m * 16];
+        }
+    }
+
+    if (row_ok) {
+        const float inv = 1.0f / l_i;
+        float* orow = out + (long)(q0 + r) * d_model + (long)h * hd + c;
+        #pragma unroll
+        for (int m = 0; m < PFA_MAX_DPL; ++m)
+            if (m < dpl) orow[m * 16] = o[m] * inv;
+    }
+}
+
+// Returns 1 when it ran, 0 when this shape or device cannot use it (head_dim not a multiple of 16 or
+// above 256, or the >48 KB shared-memory opt-in refused), so the caller keeps the split kernel.
+template <typename KV>
+static int attention_prefill_launch(const float* q, const KV* kc, const KV* vc, float* out,
+                                    int new_tokens, int start_pos, int num_heads, int heads_per_kv,
+                                    int head_dim, int capacity, float scale) {
+    if (new_tokens <= 0 || head_dim <= 0 || (head_dim & 15) || head_dim > 16 * PFA_MAX_DPL) return 0;
+    const size_t smem = (size_t)(PFA_BQ * head_dim + PFA_BK * (head_dim + 1) + PFA_BK * head_dim +
+                                 PFA_BQ * PFA_BK) * sizeof(float);
+    static size_t granted = 0;   // per instantiation: the largest opt-in already accepted
+    if (smem > granted) {
+        if (cudaFuncSetAttribute(attention_prefill_kernel<KV>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        granted = smem;
+    }
+    dim3 grid((new_tokens + PFA_BQ - 1) / PFA_BQ, num_heads);
+    attention_prefill_kernel<KV><<<grid, 256, smem>>>(q, kc, vc, out, new_tokens, start_pos,
+                                                      num_heads, heads_per_kv, head_dim,
+                                                      capacity, scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in attention_prefill: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+} // extern "C++"
+
+int attention_prefill_f32(const float* q, const float* kc, const float* vc, float* out,
+                          int new_tokens, int start_pos, int num_heads, int heads_per_kv,
+                          int head_dim, int capacity, float scale) {
+    return attention_prefill_launch<float>(q, kc, vc, out, new_tokens, start_pos, num_heads,
+                                           heads_per_kv, head_dim, capacity, scale);
+}
+
+int attention_prefill_f16(const float* q, const unsigned short* kc, const unsigned short* vc,
+                          float* out, int new_tokens, int start_pos, int num_heads,
+                          int heads_per_kv, int head_dim, int capacity, float scale) {
+    return attention_prefill_launch<__half>(q, reinterpret_cast<const __half*>(kc),
+                                            reinterpret_cast<const __half*>(vc), out, new_tokens,
+                                            start_pos, num_heads, heads_per_kv, head_dim,
+                                            capacity, scale);
+}
+
+int attention_prefill_fp8(const float* q, const unsigned char* kc, const unsigned char* vc,
+                          float* out, int new_tokens, int start_pos, int num_heads,
+                          int heads_per_kv, int head_dim, int capacity, float scale) {
+    return attention_prefill_launch<__nv_fp8_e4m3>(q, reinterpret_cast<const __nv_fp8_e4m3*>(kc),
+                                                   reinterpret_cast<const __nv_fp8_e4m3*>(vc), out,
+                                                   new_tokens, start_pos, num_heads, heads_per_kv,
+                                                   head_dim, capacity, scale);
+}
+
 void attention_split_kv_f32(const float* q, const float* kc, const float* vc,
                             float* out, float* ws, int new_tokens, int start_pos,
                             int num_heads, int heads_per_kv, int head_dim,
@@ -2082,6 +2261,21 @@ static int iq_gemv_grid(int rows) {
     return blocks < need ? blocks : need;
 }
 
+// Grid for the persistent i-quant row-dequant kernels: 256 threads (8 warps) per block, one warp per
+// 256-value block of weight, a few blocks per SM so each stages its codebook once.
+static int iq_dequant_grid(long items) {
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 1;
+    }
+    long need = (items + 7) / 8;
+    long blocks = (long)sms * 8;
+    return (int)(blocks < need ? blocks : (need > 0 ? need : 1));
+}
+
 // Sum of eight codebook values with their signs applied, against eight activations. `g1`/`g2` each
 // pack four unsigned magnitudes; bit j of `sg` negates value j.
 __device__ __forceinline__ float iq3_dot8(unsigned int g1, unsigned int g2, unsigned int sg,
@@ -2262,28 +2456,31 @@ __global__ void gemv_iq4xs_kernel(const float* __restrict__ x,
 __global__ void dequant_iq4xs_rows_kernel(const unsigned char* __restrict__ w,
                                           float* __restrict__ out,
                                           int row0, int rows, int K) {
-    const int r = blockIdx.x;
-    if (r >= rows) return;
+    // Persistent, one warp per 256-value block (see iq_dequant_grid). A lane owns four qs bytes,
+    // i.e. four low-nibble values and the four high-nibble values 16 further on, as in the GEMV.
+    const int lane = threadIdx.x & 31;
+    const int b0 = lane * 4;
+    const int ib = b0 >> 4;
+    const int vlo = ib * 32 + (b0 & 15);
     const int nblocks = K / GGUF_QK_K;
     const long row_bytes = (long)nblocks * GGUF_IQ4XS_BLOCK_BYTES;
-    const unsigned char* wrow = w + (long)(row0 + r) * row_bytes;
-    float* orow = out + (long)r * K;
-
-    for (int b = blockIdx.y; b < nblocks; b += gridDim.y) {
-        const unsigned char* block = wrow + (long)b * GGUF_IQ4XS_BLOCK_BYTES;
+    const long items = (long)rows * nblocks;
+    const long nwarps = (long)gridDim.x * (blockDim.x >> 5);
+    for (long it = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); it < items; it += nwarps) {
+        const int r = (int)(it / nblocks);
+        const int b = (int)(it - (long)r * nblocks);
+        const unsigned char* block = w + (long)(row0 + r) * row_bytes + (long)b * GGUF_IQ4XS_BLOCK_BYTES;
         const float d = __half2float(*((const __half*)(block + 0)));
         const unsigned short scales_h = *((const unsigned short*)(block + 2));
         const unsigned char* scales_l = block + 4;
-        const unsigned char* qs = block + 8;
-        for (int t = threadIdx.x; t < 128; t += blockDim.x) {
-            const int ib = t >> 4;
-            const int off = t & 15;
-            const int ls = ((scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
-            const float dl = d * (float)(ls - 32);
-            const unsigned char byte = qs[t];
-            orow[b * GGUF_QK_K + ib * 32 + off]      = dl * iq4nl_val(byte & 0xF);
-            orow[b * GGUF_QK_K + ib * 32 + off + 16] = dl * iq4nl_val(byte >> 4);
-        }
+        const int ls = ((scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+        const float dl = d * (float)(ls - 32);
+        const uchar4 q = *((const uchar4*)(block + 8 + b0));
+        float* orow = out + (long)r * K + b * GGUF_QK_K;
+        *((float4*)(orow + vlo)) = make_float4(dl * iq4nl_val(q.x & 0xF), dl * iq4nl_val(q.y & 0xF),
+                                               dl * iq4nl_val(q.z & 0xF), dl * iq4nl_val(q.w & 0xF));
+        *((float4*)(orow + vlo + 16)) = make_float4(dl * iq4nl_val(q.x >> 4), dl * iq4nl_val(q.y >> 4),
+                                                    dl * iq4nl_val(q.z >> 4), dl * iq4nl_val(q.w >> 4));
     }
 }
 
@@ -2296,72 +2493,85 @@ __global__ void dequant_iq4xs_rows_kernel(const unsigned char* __restrict__ w,
 __global__ void dequant_iq3xxs_rows_kernel(const unsigned char* __restrict__ w,
                                           float* __restrict__ out,
                                           int row0, int rows, int K) {
-    const int r = blockIdx.x;
-    if (r >= rows) return;
+    // Persistent, one warp per 256-value block, codebook staged once per resident block. The
+    // previous shape launched 256 threads per (row, block) of which only lanes 0-31 worked.
+    __shared__ unsigned int s_grid[256];
+    __shared__ unsigned char s_ksigns[128];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_grid[i] = d_iq3xxs_grid[i];
+    for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns[i] = d_ksigns_iq2xs[i];
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int ib32 = lane >> 2;
+    const int lpos = lane & 3;
     const int nblocks = K / GGUF_QK_K;
     const long row_bytes = (long)nblocks * GGUF_IQ3XXS_BLOCK_BYTES;
-    const unsigned char* wrow = w + (long)(row0 + r) * row_bytes;
-    float* orow = out + (long)r * K;
-
-    for (int b = blockIdx.y; b < nblocks; b += gridDim.y) {
-        const unsigned char* block = wrow + (long)b * GGUF_IQ3XXS_BLOCK_BYTES;
+    const long items = (long)rows * nblocks;
+    const long nwarps = (long)gridDim.x * (blockDim.x >> 5);
+    for (long it = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); it < items; it += nwarps) {
+        const int r = (int)(it / nblocks);
+        const int b = (int)(it - (long)r * nblocks);
+        const unsigned char* block = w + (long)(row0 + r) * row_bytes + (long)b * GGUF_IQ3XXS_BLOCK_BYTES;
         const float d = __half2float(*((const __half*)(block + 0)));
         const unsigned char* qs = block + 2;
-        const unsigned char* sas = qs + 64;
-        for (int t = threadIdx.x; t < 32; t += blockDim.x) {
-            const int ib32 = t >> 2;
-            const int lpos = t & 3;
-            unsigned int aux32;
-            memcpy(&aux32, sas + 4 * ib32, sizeof(unsigned int));
-            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
-            const unsigned char signs = d_ksigns_iq2xs[(aux32 >> (7 * lpos)) & 127];
-            const unsigned char* g1 = (const unsigned char*)(d_iq3xxs_grid + qs[8 * ib32 + 2 * lpos + 0]);
-            const unsigned char* g2 = (const unsigned char*)(d_iq3xxs_grid + qs[8 * ib32 + 2 * lpos + 1]);
-            float* op = orow + b * GGUF_QK_K + ib32 * 32 + lpos * 8;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                op[j + 0] = db * (float)g1[j] * ((signs & (1u << (j + 0))) ? -1.0f : 1.0f);
-                op[j + 4] = db * (float)g2[j] * ((signs & (1u << (j + 4))) ? -1.0f : 1.0f);
-            }
-        }
+        const unsigned short* sp = (const unsigned short*)(qs + 64 + 4 * ib32);
+        const unsigned int aux32 = (unsigned int)sp[0] | ((unsigned int)sp[1] << 16);
+        const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+        const unsigned int sg = s_ksigns[(aux32 >> (7 * lpos)) & 127];
+        const unsigned short q2 = *((const unsigned short*)(qs + 8 * ib32 + 2 * lpos));
+        const unsigned int g1 = s_grid[q2 & 0xff], g2 = s_grid[q2 >> 8];
+        float4* op = (float4*)(out + (long)r * K + b * GGUF_QK_K + ib32 * 32 + lpos * 8);
+        op[0] = make_float4(db * (float)((g1      ) & 0xff) * ((sg & 0x01) ? -1.0f : 1.0f),
+                            db * (float)((g1 >>  8) & 0xff) * ((sg & 0x02) ? -1.0f : 1.0f),
+                            db * (float)((g1 >> 16) & 0xff) * ((sg & 0x04) ? -1.0f : 1.0f),
+                            db * (float)((g1 >> 24)       ) * ((sg & 0x08) ? -1.0f : 1.0f));
+        op[1] = make_float4(db * (float)((g2      ) & 0xff) * ((sg & 0x10) ? -1.0f : 1.0f),
+                            db * (float)((g2 >>  8) & 0xff) * ((sg & 0x20) ? -1.0f : 1.0f),
+                            db * (float)((g2 >> 16) & 0xff) * ((sg & 0x40) ? -1.0f : 1.0f),
+                            db * (float)((g2 >> 24)       ) * ((sg & 0x80) ? -1.0f : 1.0f));
     }
 }
 
 __global__ void dequant_iq3s_rows_kernel(const unsigned char* __restrict__ w,
                                         float* __restrict__ out,
                                         int row0, int rows, int K) {
-    const int r = blockIdx.x;
-    if (r >= rows) return;
+    // Same persistent shape as dequant_iq3xxs_rows_kernel.
+    __shared__ unsigned int s_grid[512];
+    for (int i = threadIdx.x; i < 512; i += blockDim.x) s_grid[i] = d_iq3s_grid[i];
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int ib32 = lane >> 2;
+    const int lpos = lane & 3;
     const int nblocks = K / GGUF_QK_K;
     const long row_bytes = (long)nblocks * GGUF_IQ3S_BLOCK_BYTES;
-    const unsigned char* wrow = w + (long)(row0 + r) * row_bytes;
-    float* orow = out + (long)r * K;
-
-    for (int b = blockIdx.y; b < nblocks; b += gridDim.y) {
-        const unsigned char* block = wrow + (long)b * GGUF_IQ3S_BLOCK_BYTES;
+    const long items = (long)rows * nblocks;
+    const long nwarps = (long)gridDim.x * (blockDim.x >> 5);
+    for (long it = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); it < items; it += nwarps) {
+        const int r = (int)(it / nblocks);
+        const int b = (int)(it - (long)r * nblocks);
+        const unsigned char* block = w + (long)(row0 + r) * row_bytes + (long)b * GGUF_IQ3S_BLOCK_BYTES;
         const float d = __half2float(*((const __half*)(block + 0)));
         const unsigned char* qs = block + 2;
         const unsigned char* qh = block + 2 + 64;
         const unsigned char* signs = block + 2 + 64 + 8;
         const unsigned char* scales = block + 2 + 64 + 8 + 32;
-        for (int t = threadIdx.x; t < 32; t += blockDim.x) {
-            const int ib32 = t >> 2;
-            const int lpos = t & 3;
-            const int ls = (ib32 & 1) ? (scales[ib32 >> 1] >> 4) : (scales[ib32 >> 1] & 0xf);
-            const float db = d * (1 + 2 * ls);
-            const unsigned char sg = signs[4 * ib32 + lpos];
-            const unsigned char qhb = qh[ib32];
-            const int i1 = qs[8 * ib32 + 2 * lpos + 0] | ((qhb << (8 - 2 * lpos)) & 256);
-            const int i2 = qs[8 * ib32 + 2 * lpos + 1] | ((qhb << (7 - 2 * lpos)) & 256);
-            const unsigned char* g1 = (const unsigned char*)(d_iq3s_grid + i1);
-            const unsigned char* g2 = (const unsigned char*)(d_iq3s_grid + i2);
-            float* op = orow + b * GGUF_QK_K + ib32 * 32 + lpos * 8;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                op[j + 0] = db * (float)g1[j] * ((sg & (1u << (j + 0))) ? -1.0f : 1.0f);
-                op[j + 4] = db * (float)g2[j] * ((sg & (1u << (j + 4))) ? -1.0f : 1.0f);
-            }
-        }
+        const int ls = (scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0xf;
+        const float db = d * (1 + 2 * ls);
+        const unsigned int sg = signs[4 * ib32 + lpos];
+        const unsigned int qhb = qh[ib32];
+        const unsigned short q2 = *((const unsigned short*)(qs + 8 * ib32 + 2 * lpos));
+        const unsigned int g1 = s_grid[(q2 & 0xff) | ((qhb << (8 - 2 * lpos)) & 256)];
+        const unsigned int g2 = s_grid[(q2 >> 8) | ((qhb << (7 - 2 * lpos)) & 256)];
+        float4* op = (float4*)(out + (long)r * K + b * GGUF_QK_K + ib32 * 32 + lpos * 8);
+        op[0] = make_float4(db * (float)((g1      ) & 0xff) * ((sg & 0x01) ? -1.0f : 1.0f),
+                            db * (float)((g1 >>  8) & 0xff) * ((sg & 0x02) ? -1.0f : 1.0f),
+                            db * (float)((g1 >> 16) & 0xff) * ((sg & 0x04) ? -1.0f : 1.0f),
+                            db * (float)((g1 >> 24)       ) * ((sg & 0x08) ? -1.0f : 1.0f));
+        op[1] = make_float4(db * (float)((g2      ) & 0xff) * ((sg & 0x10) ? -1.0f : 1.0f),
+                            db * (float)((g2 >>  8) & 0xff) * ((sg & 0x20) ? -1.0f : 1.0f),
+                            db * (float)((g2 >> 16) & 0xff) * ((sg & 0x40) ? -1.0f : 1.0f),
+                            db * (float)((g2 >> 24)       ) * ((sg & 0x80) ? -1.0f : 1.0f));
     }
 }
 
@@ -2948,26 +3158,20 @@ __global__ void dequant_q6k_rows_kernel(const unsigned char* __restrict__ w,
 
 void dequant_iq4xs_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq4xs_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq4xs_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void dequant_iq3xxs_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq3xxs_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq3xxs_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void dequant_iq3s_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq3s_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq3s_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_q2k_lb(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
@@ -2978,10 +3182,8 @@ void gemv_q2k_lb(const float* x, const unsigned char* w, float* y, int M, int N,
 
 void dequant_q2k_lb_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_q2k_lb_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_q2k_lb_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_iq2xxs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
@@ -2992,10 +3194,8 @@ void gemv_iq2xxs(const float* x, const unsigned char* w, float* y, int M, int N,
 
 void dequant_iq2xxs_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq2xxs_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq2xxs_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_iq2xs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
@@ -3006,10 +3206,8 @@ void gemv_iq2xs(const float* x, const unsigned char* w, float* y, int M, int N, 
 
 void dequant_iq2xs_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq2xs_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq2xs_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_iq2s(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
@@ -3020,10 +3218,8 @@ void gemv_iq2s(const float* x, const unsigned char* w, float* y, int M, int N, i
 
 void dequant_iq2s_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq2s_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq2s_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_iq1m(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
@@ -3034,10 +3230,8 @@ void gemv_iq1m(const float* x, const unsigned char* w, float* y, int M, int N, i
 
 void dequant_iq1m_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq1m_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq1m_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_iq1s(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
@@ -3048,10 +3242,8 @@ void gemv_iq1s(const float* x, const unsigned char* w, float* y, int M, int N, i
 
 void dequant_iq1s_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
     if (n_rows <= 0 || K <= 0) return;
-    int nblocks = K / GGUF_QK_K;
-    int by = nblocks < 32 ? nblocks : 32;
-    dim3 grid(n_rows, by);
-    dequant_iq1s_rows_kernel<<<grid, 256>>>(w, out, row0, n_rows, K);
+    long items = (long)n_rows * (K / GGUF_QK_K);
+    dequant_iq1s_rows_kernel<<<iq_dequant_grid(items), 256>>>(w, out, row0, n_rows, K);
 }
 
 void gemv_iq3xxs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {

@@ -294,7 +294,10 @@ module SHAInet
         #
         # It also converts an OOM at token 8000 into an ArgumentError at the point the budget is
         # exceeded, which a caller can act on.
-        net.layers.each do |layer|
+        #
+        # hidden_layers, not layers: Network#layers is a lazily created array the GGUF stack never
+        # fills, so iterating it pinned nothing and every cache silently kept doubling.
+        net.hidden_layers.each do |layer|
           layer.kv_max_context = max_context if layer.responds_to?(:kv_max_context=)
         end
 
@@ -370,7 +373,13 @@ module SHAInet
     # SHAINET_GDN_CHUNK / SHAINET_PREFILL_CHUNK still win: an explicit setting is never overridden.
     private def self.tune_prefill_chunk(kv_per_token : Int64, max_context : Int32)
       return unless CUDA.fully_available?
-      return if ENV["SHAINET_GDN_CHUNK"]? || ENV["SHAINET_PREFILL_CHUNK"]?
+      if ENV["SHAINET_GDN_CHUNK"]? || ENV["SHAINET_PREFILL_CHUNK"]?
+        # An explicit chunk still needs the network-level slice raised to match, or the slice (512 by
+        # default) stays the binding cap and SHAINET_PREFILL_CHUNK=1024 behaves exactly like 512.
+        explicit = [ENV["SHAINET_GDN_CHUNK"]?, ENV["SHAINET_PREFILL_CHUNK"]?].compact.compact_map(&.to_i?).max?
+        Network.prefill_rows = explicit if explicit && Network.prefill_rows < explicit
+        return
+      end
       info = CUDA.memory_info
       return unless info
       free_mb = info[:free] // (1024 * 1024)

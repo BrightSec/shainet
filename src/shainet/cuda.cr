@@ -424,6 +424,7 @@ module SHAInet
     @@attention_kv_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
     @@attention_split_kv_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
     @@kv_fp8_available : Bool? = nil
+    @@attention_prefill_procs = {} of String => Proc(Pointer(Float32), Pointer(Void), Pointer(Void), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Int32)?
     @@attention_split_ws_floats_proc : Proc(Int32, Int32, Int32, Int32, Int32)?
 
     def softmax_rows(dst : Pointer(Float32), src : Pointer(Float32), rows : Int32, cols : Int32)
@@ -1872,6 +1873,26 @@ module SHAInet
       fn.call(q, kc, vc, out_ptr, ws, new_tokens, start_pos, num_heads,
         heads_per_kv, head_dim, capacity, scale)
       true
+    end
+
+    # Tiled prefill attention over the device KV cache (attention_prefill_* in the kernel library).
+    # `suffix` is the cache dtype ("f32", "f16", "fp8"); the cache pointers are passed untyped since
+    # only their element type differs. Returns false when the kernel is missing or declined the shape,
+    # so the caller keeps the split-KV path.
+    def attention_prefill(suffix : String, q : Pointer(Float32), kc : Pointer(Void), vc : Pointer(Void),
+                          out_ptr : Pointer(Float32), new_tokens : Int32, start_pos : Int32,
+                          num_heads : Int32, heads_per_kv : Int32, head_dim : Int32,
+                          capacity : Int32, scale : Float32) : Bool
+      name = "attention_prefill_#{suffix}"
+      unless @@attention_prefill_procs.has_key?(name)
+        @@attention_prefill_procs[name] = load_kernel_proc(name,
+          Proc(Pointer(Float32), Pointer(Void), Pointer(Void), Pointer(Float32), Int32, Int32, Int32,
+               Int32, Int32, Int32, Float32, Int32))
+      end
+      fn = @@attention_prefill_procs[name]
+      return false unless fn
+      fn.call(q, kc, vc, out_ptr, new_tokens, start_pos, num_heads, heads_per_kv, head_dim,
+        capacity, scale) != 0
     end
 
     # Whether the loaded kernel library has the fp8 KV kernels. A prebuilt .so from before them
