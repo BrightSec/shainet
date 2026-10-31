@@ -1832,7 +1832,9 @@ module AgentDemo
         if (bar = @status_bar) && generated.size % 8 == 0 && generated.size > 0
           secs = (Time.instant - gen_started).total_seconds
           rate = secs > 0 ? generated.size / secs : 0.0
-          bar.text = " ctx #{context_tokens}/#{@max_context} · #{generated.size} tok · " \
+          # @cache_ids is what the KV cache holds (prompt plus tokens generated so far). context_tokens
+          # rebuilds and re-tokenizes the whole transcript, which is too much work for every 8 tokens.
+          bar.text = " ctx #{@cache_ids.size}/#{@max_context} · #{generated.size} tok · " \
                      "#{rate.round(1)} tok/s · #{secs.round(0).to_i}s"
         end
         row = logits.rows - 1

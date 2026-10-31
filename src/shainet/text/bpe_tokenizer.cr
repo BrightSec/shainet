@@ -13,6 +13,48 @@ module SHAInet
     property merges_map = Hash(Tuple(String, String), String).new
     property merges_rank = Hash(Tuple(String, String), Int32).new
     property? hf_mode : Bool = false
+    # Byte-level BPE models split text with a regex BEFORE merging, and merges never cross a split.
+    # nil keeps the old whole-text behaviour for tokenizers whose split is unknown.
+    property pre_regex : Regex? = nil
+
+    # Pre-tokenizer regexes by GGUF `tokenizer.ggml.pre` name, as in llama.cpp's llama-vocab.cpp
+    # (the tokenizer.json originals; PCRE2 takes them as written).
+    PRE_REGEXES = {
+      "qwen35" => %q{(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+},
+      "qwen2"  => %q{(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+},
+      "llama-bpe" => %q{(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+},
+      "gpt2"   => %q{'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+},
+    }
+
+    # Select the pre-tokenizer for a GGUF `tokenizer.ggml.pre` value. Unknown names leave it unset.
+    def pre_tokenizer=(name : String)
+      if pat = PRE_REGEXES[name]?
+        @pre_regex = Regex.new(pat)
+      else
+        Log.warn { "BPE: unknown pre-tokenizer '#{name}'; encoding without a pre-split" }
+      end
+    end
+
+    # Added tokens matched literally before the pre-split, e.g. Qwen's <tool_call> and <think>
+    # (GGUF token type USER_DEFINED, or non-special added_tokens in tokenizer.json). Control tokens
+    # such as <|im_end|> are deliberately NOT here: like llama.cpp with parse_special off, text that
+    # spells them stays text, so a file or tool output cannot inject chat structure.
+    @literal_ids = Hash(String, Int32).new
+    @literal_regex : Regex? = nil
+
+    def add_literal_token(token : String, id : Int32)
+      return if token.empty?
+      @literal_ids[token] = id
+      # Longest first, so a token that prefixes another cannot win.
+      @literal_regex = Regex.union(@literal_ids.keys.sort_by { |t| -t.bytesize })
+    end
+
+    # Merge table keyed by token-id pair, built on first use: (a << 32 | b) -> {rank, merged id}.
+    @id_merges : Hash(Int64, Tuple(Int32, Int32))? = nil
+    # BPE result per pre-token piece. Text repeats heavily (words, indentation, punctuation), so most
+    # pieces after the first few thousand are hits.
+    @piece_cache = Hash(String, Array(Int32)).new
+    PIECE_CACHE_MAX = 200_000
 
     # GPT-2 byte-to-unicode mapping (lazily built). Maps a printable Unicode
     # codepoint back to the original raw byte it represents in byte-level BPE.
@@ -93,12 +135,17 @@ module SHAInet
         end
       end
 
+      if pat = hf_split_regex(data["pre_tokenizer"]?)
+        tok.pre_regex = Regex.new(pat)
+      end
+
       # Load added tokens (special tokens)
       if added = data["added_tokens"]?
         added.as_a.each do |t|
           token = t["content"].as_s
           id = t["id"].as_i
           tok.vocab[token] = id
+          tok.add_literal_token(token, id) unless t["special"]?.try(&.as_bool?)
           while tok.inv_vocab.size <= id
             tok.inv_vocab << ""
           end
@@ -107,6 +154,22 @@ module SHAInet
       end
 
       tok
+    end
+
+    # The Split regex of a tokenizer.json pre_tokenizer, alone or inside a Sequence.
+    private def self.hf_split_regex(pre : JSON::Any?) : String?
+      return nil unless pre && (h = pre.as_h?)
+      case h["type"]?.try(&.as_s?)
+      when "Split"
+        h["pattern"]?.try { |pt| pt["Regex"]?.try(&.as_s?) }
+      when "Sequence"
+        h["pretokenizers"]?.try(&.as_a?).try &.each do |sub|
+          if r = hf_split_regex(sub)
+            return r
+          end
+        end
+        nil
+      end
     end
 
     # Train the tokenizer vocabulary from the given text using the
@@ -190,45 +253,151 @@ module SHAInet
       ids
     end
 
-    # HF-style encode: byte-level BPE with GPT-2 unicode mapping
+    # HF-style encode: byte-level BPE with GPT-2 unicode mapping.
+    #
+    # With a pre-tokenizer the text is split first and each piece merged on its own, which is both
+    # what the model was trained on and what keeps this fast. Without one the whole text was a single
+    # "word": merges could cross word boundaries (token sequences the model never saw), and each
+    # merge rescanned the whole array, so a 39K-token transcript took 11.8 s to encode.
     private def encode_hf(text : String) : Array(Int32)
       ids = Array(Int32).new
       return ids if text.empty?
-      # Convert raw bytes to GPT-2 unicode representation
-      unicode_text = String.build do |s|
-        text.bytes.each { |b| s << BPETokenizer.byte_to_unicode(b) }
-      end
-      tokens = encode_tokens_hf(unicode_text)
-      tokens.each do |t|
-        if id = @vocab[t]?
-          ids << id
+      if lit = @literal_regex
+        pos = 0
+        while m = lit.match(text, pos)
+          encode_span(text[pos...m.begin(0)], ids) if m.begin(0) > pos
+          ids << @literal_ids[m[0]]
+          pos = m.end(0)
         end
+        encode_span(text[pos..], ids) if pos < text.size
+      else
+        encode_span(text, ids)
       end
       ids
     end
 
-    private def encode_tokens_hf(word : String) : Array(String)
-      tokens = word.chars.map(&.to_s)
-      return tokens if @merges_rank.empty? || tokens.size <= 1
+    private def encode_span(text : String, ids : Array(Int32))
+      if re = @pre_regex
+        text.scan(re) { |m| encode_piece(m[0], ids) }
+      else
+        encode_piece(text, ids)
+      end
+    end
 
-      pairs = get_pairs(tokens)
-      while !pairs.empty?
-        best_pair = nil
-        best_rank = Int32::MAX
-        pairs.each do |p|
-          if rank = @merges_rank[p]?
-            if rank < best_rank
-              best_rank = rank
-              best_pair = p
-            end
+    private def encode_piece(piece : String, ids : Array(Int32))
+      if cached = @piece_cache[piece]?
+        ids.concat(cached)
+        return
+      end
+      res = bpe_piece(piece)
+      @piece_cache.clear if @piece_cache.size >= PIECE_CACHE_MAX
+      @piece_cache[piece] = res if piece.bytesize <= 256
+      ids.concat(res)
+    end
+
+    # Byte-level BPE of one piece over token ids: a heap of candidate merges keyed (rank, position),
+    # so the lowest-rank pair merges first and ties go to the leftmost, as in HF and llama.cpp.
+    # Stale heap entries are skipped by re-checking the pair's rank when popped (a rank names exactly
+    # one pair, so an equal rank means the same pair is still there).
+    private def bpe_piece(piece : String) : Array(Int32)
+      merges = id_merges
+      bids = byte_ids
+      syms = Array(Int32).new(piece.bytesize)
+      piece.each_byte do |b|
+        id = bids[b]
+        syms << id if id >= 0
+      end
+      n = syms.size
+      return syms if n <= 1 || merges.empty?
+      nxt = Array(Int32).new(n) { |i| i + 1 < n ? i + 1 : -1 }
+      prv = Array(Int32).new(n) { |i| i - 1 }
+      alive = Array(Bool).new(n, true)
+      heap = [] of Int64
+      push = ->(i : Int32) do
+        j = nxt[i]
+        if j >= 0
+          if m = merges[(syms[i].to_i64 << 32) | syms[j].to_i64]?
+            heap_push(heap, (m[0].to_i64 << 32) | i.to_i64)
           end
         end
-        break unless best_pair
-        merge_tokens!(tokens, best_pair)
-        break if tokens.size <= 1
-        pairs = get_pairs(tokens)
+        nil
       end
-      tokens
+      (0...n - 1).each { |i| push.call(i) }
+      until heap.empty?
+        key = heap_pop(heap)
+        rank = (key >> 32).to_i32
+        i = (key & 0xFFFFFFFF).to_i32
+        next unless alive[i]
+        j = nxt[i]
+        next if j < 0
+        m = merges[(syms[i].to_i64 << 32) | syms[j].to_i64]?
+        next unless m && m[0] == rank
+        syms[i] = m[1]
+        alive[j] = false
+        k = nxt[j]
+        nxt[i] = k
+        prv[k] = i if k >= 0
+        push.call(prv[i]) if prv[i] >= 0
+        push.call(i)
+      end
+      res = Array(Int32).new
+      i = 0
+      while i >= 0
+        res << syms[i]
+        i = nxt[i]
+      end
+      res
+    end
+
+    @byte_ids : Array(Int32)? = nil
+
+    # Vocabulary id of each raw byte's GPT-2 unicode stand-in (-1 when absent).
+    private def byte_ids : Array(Int32)
+      @byte_ids ||= Array(Int32).new(256) { |b| @vocab[BPETokenizer.byte_to_unicode(b.to_u8).to_s]? || -1 }
+    end
+
+    private def id_merges : Hash(Int64, Tuple(Int32, Int32))
+      @id_merges ||= begin
+        h = Hash(Int64, Tuple(Int32, Int32)).new(initial_capacity: @merges_rank.size)
+        @merges_rank.each do |pair, rank|
+          a = @vocab[pair[0]]?
+          b = @vocab[pair[1]]?
+          m = @vocab[pair[0] + pair[1]]?
+          next unless a && b && m
+          h[(a.to_i64 << 32) | b.to_i64] = {rank, m}
+        end
+        h
+      end
+    end
+
+    private def heap_push(h : Array(Int64), v : Int64)
+      h << v
+      i = h.size - 1
+      while i > 0
+        p = (i - 1) >> 1
+        break if h[p] <= v
+        h[i] = h[p]
+        i = p
+      end
+      h[i] = v
+    end
+
+    private def heap_pop(h : Array(Int64)) : Int64
+      top = h[0]
+      last = h.pop
+      return top if h.empty?
+      i = 0
+      n = h.size
+      loop do
+        l = 2 * i + 1
+        break if l >= n
+        c = (l + 1 < n && h[l + 1] < h[l]) ? l + 1 : l
+        break if h[c] >= last
+        h[i] = h[c]
+        i = c
+      end
+      h[i] = last
+      top
     end
 
     private def encode_tokens(word : String) : Array(String)

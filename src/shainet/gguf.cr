@@ -540,6 +540,7 @@ module SHAInet
         _tensor_count = (ptr + pos).as(Pointer(UInt64)).value; pos += 8
         kv_count = (ptr + pos).as(Pointer(UInt64)).value; pos += 8
 
+        types = [] of Tuple(Int32, Int32)
         kv_count.times do
           # Read key string
           key_len = (ptr + pos).as(Pointer(UInt64)).value; pos += 8
@@ -558,6 +559,20 @@ module SHAInet
             end
             tok.inv_vocab.concat(Array(String).new(max_id + 1, ""))
             tok.vocab.each { |t, id| tok.inv_vocab[id] = t }
+          elsif key == "tokenizer.ggml.token_type" && vtype == 9
+            elem_type = (ptr + pos).as(Pointer(UInt32)).value; pos += 4
+            arr_len = (ptr + pos).as(Pointer(UInt64)).value; pos += 8
+            if elem_type == 5 # int32
+              arr_len.times do |i|
+                types << {i.to_i32, (ptr + pos).as(Pointer(Int32)).value}
+                pos += 4
+              end
+            else
+              arr_len.times { skip_gguf_value(ptr, pointerof(pos), elem_type) }
+            end
+          elsif key == "tokenizer.ggml.pre" && vtype == 8
+            slen = (ptr + pos).as(Pointer(UInt64)).value; pos += 8
+            tok.pre_tokenizer = String.new(Slice.new(ptr + pos, slen.to_i32)); pos += slen
           elsif key == "tokenizer.ggml.merges" && vtype == 9
             _elem_type = (ptr + pos).as(Pointer(UInt32)).value; pos += 4
             arr_len = (ptr + pos).as(Pointer(UInt64)).value; pos += 8
@@ -578,6 +593,14 @@ module SHAInet
           end
         end
 
+        # Type 4 = USER_DEFINED (llama.cpp's LLAMA_TOKEN_TYPE_USER_DEFINED). Resolved after the loop
+        # because the type array may come before the token strings.
+        types.each do |(id, ty)|
+          next unless ty == 4
+          if (t = tok.inv_vocab[id]?) && !t.empty?
+            tok.add_literal_token(t, id)
+          end
+        end
         tok
       ensure
         gf.close
