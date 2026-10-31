@@ -1394,6 +1394,29 @@ module AgentDemo
     end
 
     private def build_prompt : Array(Int32)
+      ids = transcript_ids
+      ids << @im_start
+      ids.concat(@tokenizer.encode("assistant\n"))
+      ids
+    end
+
+    private def system_ids : Array(Int32)
+      render_message("system", "#{@system_block}\n\n<WORKSPACE>\nAll relative paths resolve " \
+                               "against #{AgentDemo.workspace}\nThis is a #{AgentDemo.host_os} host. You are already in that " \
+                               "directory — do not cd to it, and never search the filesystem for it.\n</WORKSPACE>")
+    end
+
+    # Tokens every prompt carries regardless of the conversation: the system message (with the tool
+    # descriptions, ~2.4K tokens) and the assistant primer. Compaction targets are measured on top of
+    # this; a target below it can only be met by deleting the whole conversation.
+    def overhead_tokens : Int32
+      system_ids.size + 1 + @tokenizer.encode("assistant\n").size
+    end
+
+    # The system message and every message so far, without the assistant primer. build_prompt and the
+    # in-context summary both start with exactly these ids, which is what lets a summary reuse the KV
+    # cache instead of re-prefilling the conversation.
+    private def transcript_ids : Array(Int32)
       # The workspace is appended HERE rather than baked into @system_block, which is built once at
       # construction: /workspace can change the root mid-session, and a stale root in the system
       # message is worse than none.
@@ -1402,9 +1425,7 @@ module AgentDemo
       # tried `cd /Users/...` -- a macOS path, on Linux -- and then `find / -name agent.cr`, a scan of
       # the entire filesystem, to work out its own location. Every path it handles is relative to this
       # directory, so it is the one fact the prompt cannot afford to omit.
-      ids = render_message("system", "#{@system_block}\n\n<WORKSPACE>\nAll relative paths resolve " \
-                                     "against #{AgentDemo.workspace}\nThis is a #{AgentDemo.host_os} host. You are already in that " \
-                                     "directory — do not cd to it, and never search the filesystem for it.\n</WORKSPACE>")
+      ids = system_ids
       @messages.each do |m|
         if m.role == "tool"
           ids.concat(render_message("user", "<tool_response>\n#{m.content}\n</tool_response>"))
@@ -1414,8 +1435,6 @@ module AgentDemo
           ids.concat(render_message(m.role, m.content))
         end
       end
-      ids << @im_start
-      ids.concat(@tokenizer.encode("assistant\n"))
       ids
     end
 
@@ -1459,33 +1478,123 @@ module AgentDemo
       end
     end
 
-    # Summarize a slice of old messages into a single concise note using the
-    # model itself (Claude/Kiro-style compaction) so history is condensed rather
-    # than lost. Falls back to a plain marker if the model returns nothing.
-    private def summarize(msgs : Array(Message)) : String
-      transcript = String.build do |s|
-        msgs.each { |m| s << m.role << ": " << m.content << "\n\n" }
+    # Longest summary the model may write, and the instruction it gets.
+    SUMMARY_TOKENS = 1024
+    SUMMARY_INSTRUCTION = "Write a summary of the conversation so far. It will REPLACE the older " \
+                          "messages, so it must carry everything still needed to continue: the user's " \
+                          "goals and requests, decisions made, every file path read or changed, commands " \
+                          "and their outcomes, important tool results, and any unfinished work. If the " \
+                          "conversation starts with an earlier summary, carry its facts forward -- they " \
+                          "exist nowhere else. Do not call any tools. Be concise and factual. Output " \
+                          "only the summary."
+
+    # Below this an in-context summary is treated as a misfire. Observed once: a 35-token "summary"
+    # that recorded nothing, after which the model could not say which files it had read.
+    MIN_SUMMARY_TOKENS = 48
+
+    # The assistant primer with an EMPTY think block: Qwen's way of asking for an answer without
+    # reasoning first. A summary does not need it, and reasoning would spend the token budget before
+    # the summary starts.
+    private def no_think_primer : Array(Int32)
+      ids = [@im_start]
+      ids.concat(@tokenizer.encode("assistant\n<think>\n\n</think>\n\n"))
+      ids
+    end
+
+    # Summarize `head` -- the messages about to be dropped -- with the model itself, so history is
+    # condensed rather than lost.
+    #
+    # The first choice is to ask IN the conversation: the current transcript plus one instruction.
+    # The KV cache already holds that transcript, so only the instruction is prefilled. The previous
+    # version asked in a fresh prompt (its own system message, the head re-rendered as text), which
+    # threw the cache away and re-prefilled the whole old history -- tens of thousands of tokens at
+    # exactly the moment the context was too large -- and could itself exceed the window.
+    #
+    # When the transcript leaves no room for the instruction and a summary (one oversized message can
+    # do that), fall back to summarizing the head on its own, in bounded chunks.
+    private def summarize(head : Array(Message)) : String
+      instr = render_message("user", SUMMARY_INSTRUCTION)
+      base = transcript_ids
+      fits = base.size + instr.size + no_think_primer.size + SUMMARY_TOKENS <= @max_context
+      # Only worth it when the cache already holds (nearly all of) the transcript. After the OOM
+      # recovery has cleared the cache, asking in-context would re-prefill the very transcript that
+      # just ran out of memory; the bounded standalone path is the safer one there.
+      cached = 0
+      limit = Math.min(@cache_ids.size, base.size)
+      while cached < limit && @cache_ids[cached] == base[cached]
+        cached += 1
       end
-      instruction = "Summarize the following conversation between a user and an AI coding " \
-                    "assistant. Preserve key facts, decisions, file paths, tool results, and " \
-                    "any unfinished tasks. Be concise.\n\n#{transcript}"
-      prompt = render_message("system", "You write concise, faithful conversation summaries.")
-      prompt.concat(render_message("user", instruction))
-      prompt << @im_start
-      prompt.concat(@tokenizer.encode("assistant\n"))
-      summary = generate_from(prompt, 384)[0].strip
+      if fits && cached * 10 >= base.size * 9
+        prompt = base + instr + no_think_primer
+        summary = clean_summary(generate_from(prompt, SUMMARY_TOKENS)[0])
+        return summary if @tokenizer.encode(summary).size >= MIN_SUMMARY_TOKENS
+        STDERR.puts "  [agent] in-context summary came back empty; summarizing the old messages directly".colorize(:dark_gray)
+      end
+      summarize_standalone(head)
+    end
+
+    # Fallback summary over the head alone, as a rolling summary over chunks that each fit half the
+    # window: every call is bounded no matter how large the history is.
+    private def summarize_standalone(head : Array(Message)) : String
+      budget = @max_context // 2
+      summary = ""
+      chunk = String::Builder.new
+      chunk_tokens = 0
+      flush = ->(text : String) do
+        intro = summary.empty? ? "" : "Summary of the conversation before this part:\n#{summary}\n\n"
+        instruction = "#{intro}Conversation:\n#{text}\n\n#{SUMMARY_INSTRUCTION}"
+        prompt = render_message("system", "You write concise, faithful conversation summaries.")
+        prompt.concat(render_message("user", instruction))
+        prompt.concat(no_think_primer)
+        summary = clean_summary(generate_from(prompt, SUMMARY_TOKENS)[0])
+      end
+      head.each do |m|
+        line = "#{m.role}: #{transcript_text(m)}\n\n"
+        t = @tokenizer.encode(line).size
+        if chunk_tokens > 0 && chunk_tokens + t > budget
+          flush.call(chunk.to_s)
+          chunk = String::Builder.new
+          chunk_tokens = 0
+        end
+        chunk << line
+        chunk_tokens += t
+      end
+      flush.call(chunk.to_s) if chunk_tokens > 0
       summary.empty? ? TRUNCATION_MARKER : summary
     end
 
-    # Compact the transcript to fit `target` tokens: keep a recent tail, and
-    # replace the older head with a model-written summary. Hard-trims as a last
-    # resort if it still doesn't fit. Returns tokens removed.
-    def compact!(target : Int32) : Int32
-      before = context_tokens
-      return 0 if before <= target || @messages.size <= 1
+    # A message as the standalone summarizer sees it: reasoning dropped, and long bodies (tool output
+    # above all) cut to their start and end, which is where the useful part of a log or a file is.
+    private def transcript_text(m : Message) : String
+      text = m.content.gsub(/<think>.*?<\/think>/m, "").strip
+      ids = @tokenizer.encode(text)
+      return text if ids.size <= 1500
+      "#{@tokenizer.decode(ids[0, 1000]).scrub}\n... [#{ids.size - 1500} tokens omitted] ...\n" \
+      "#{@tokenizer.decode(ids[-500..]).scrub}"
+    end
 
-      # Keep the most recent messages within ~half the target; summarize the rest.
-      keep_budget = target // 2
+    private def clean_summary(text : String) : String
+      text.gsub(/<think>.*?<\/think>/m, "").gsub(/<\/?think>/, "")
+        .gsub(/<tool_call>.*?(<\/tool_call>|\z)/m, "").strip
+    end
+
+    # Compact the transcript toward `target` tokens: keep a recent tail verbatim and replace the older
+    # head with a model-written summary, hard-trimming as a last resort. Returns tokens removed.
+    #
+    # `force` compacts even when the transcript is already under `target`, which is what /compact
+    # means: without it the command returned 0 for any session below 75% of the window -- that is,
+    # it did nothing in exactly the sessions where someone thinks to run it.
+    #
+    # Never raises. A summary that fails (out of memory, interrupted) falls back to dropping the head
+    # with a marker; the old version let the exception out of the turn and took the agent down.
+    def compact!(target : Int32, force : Bool = false) : Int32
+      before = context_tokens
+      return 0 if @messages.size <= 1
+      return 0 if before <= target && !force
+
+      # Keep the most recent messages within ~half of what the target leaves for the conversation;
+      # summarize the rest.
+      keep_budget = Math.max(0, target - overhead_tokens) // 2
       tail = [] of Message
       tail_tokens = 0
       @messages.reverse_each do |m|
@@ -1501,28 +1610,54 @@ module AgentDemo
         return truncate!(target)
       end
 
-      summary = summarize(head)
-      @messages = [Message.new("user", "[Summary of earlier conversation]\n#{summary}")] + tail
+      STDERR.puts "  [agent] summarizing #{head.size} older message(s) to free context...".colorize(:dark_gray)
+      summary = begin
+        summarize(head)
+      rescue ex
+        STDERR.puts "  [agent] summary failed (#{ex.message}); dropping the older messages instead".colorize(:yellow)
+        reset_cache!
+        nil
+      end
+      if summary
+        STDERR.puts "  [agent] summary: #{@tokenizer.encode(summary).size} tokens".colorize(:dark_gray)
+        summary.each_line { |l| STDERR.puts "    │ #{l}".colorize(:dark_gray) }
+        @messages = [Message.new("user", "#{SUMMARY_PREFIX}\n#{summary}")] + tail
+      else
+        @messages = [Message.new("user", TRUNCATION_MARKER)] + tail
+      end
       # If the summary + tail still overflow, drop oldest until it fits.
       truncate!(target)
       before - context_tokens
     end
 
     # Plain sliding-window drop of oldest messages with a marker. Returns tokens removed.
+    #
+    # A leading summary is kept: it is the condensed form of everything already dropped, so trimming
+    # starts with the oldest message AFTER it. Dropping it first -- as this did -- meant a compaction
+    # whose summary plus tail ran over the target deleted the summary it had just written.
     private def truncate!(target : Int32) : Int32
       before = context_tokens
+      keep = @messages.first?.try(&.content.starts_with?(SUMMARY_PREFIX)) ? 1 : 0
       trimmed = false
-      while context_tokens > target && @messages.size > 1
-        @messages.shift
+      while context_tokens > target && @messages.size > keep + 1
+        @messages.delete_at(keep)
         trimmed = true
       end
-      if trimmed && (@messages.empty? || @messages.first.content != TRUNCATION_MARKER)
+      if trimmed && keep == 0 && (@messages.empty? || @messages.first.content != TRUNCATION_MARKER)
         @messages.unshift(Message.new("user", TRUNCATION_MARKER))
       end
       before - context_tokens
     end
 
+    SUMMARY_PREFIX = "[Summary of earlier conversation]"
+
     TRUNCATION_MARKER = "[Earlier conversation was truncated to fit the context window.]"
+
+    # Tokens a turn keeps free for the model's reply. Bounded by a quarter of the window so a large
+    # max_tokens on a small window does not make every turn compact.
+    def reply_reserve(max_tokens : Int32) : Int32
+      Math.min(max_tokens, @max_context // 4)
+    end
 
     # One-line status: context usage, VRAM, expert-cache hit rate.
     def status : String
@@ -1651,6 +1786,9 @@ module AgentDemo
     # Generate from an explicit prompt. When echo is set, the user-facing prose is streamed
     # live (with <think> and tool-call markup filtered out).
     private def generate_from(prompt : Array(Int32), max_tokens : Int32, echo : Bool = false) : Tuple(String, Array(Int32))
+      # Never generate past the KV budget: the cache is pinned at @max_context, and running into it
+      # mid-reply raises out of the decode loop and loses the turn.
+      max_tokens = Math.min(max_tokens, @max_context - prompt.size)
       logits = prefill(prompt)
       generated = [] of Int32
       renderer = echo ? AgentDemo::StreamRenderer.new(STDERR) : nil
@@ -1764,9 +1902,12 @@ module AgentDemo
             "could not finish.")
         end
 
-        # Keep the prompt within the context budget (compact to 75% to leave room
-        # for the response + any tool round-trips before the next compaction).
-        if context_tokens > @max_context
+        # Keep the prompt AND its reply within the context budget. Compacting only once the prompt
+        # alone exceeded the window let a 63K prompt start a 4K reply against a 64K KV budget: the
+        # cache filled mid-reply, the turn died with "generation failed", and the next turn -- same
+        # size, still under the window -- did it again. Compact to 75% to leave room for the reply
+        # and a few tool round-trips before the next compaction.
+        if context_tokens + reply_reserve(max_tokens) > @max_context
           removed = compact!((@max_context * 0.75).to_i)
           STDERR.puts "  [agent] context compacted (−#{removed} tokens)" if removed > 0
         end
@@ -2181,7 +2322,10 @@ loop do
     STDERR.puts "  #{agent.status}".colorize(:dark_gray)
     next
   when "/compact"
-    removed = agent.compact!((agent.max_context * 0.75).to_i)
+    # Forced: summarize everything but the most recent quarter of the transcript, whatever its size.
+    overhead = agent.overhead_tokens
+    target = Math.min(overhead + (agent.context_tokens - overhead) // 2, (agent.max_context * 0.75).to_i)
+    removed = agent.compact!(target, force: true)
     STDERR.puts "  compacted −#{removed} tokens · #{agent.status}".colorize(:dark_gray)
     next
   when "/clear"
