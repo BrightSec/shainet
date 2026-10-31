@@ -363,9 +363,14 @@ module SHAInet
     @@mq_xsum_elems : Int64 = 0_i64
 
     # Rows decoded per GEMM launch. The int8 slice is written by the decode and read straight back by
-    # the GEMM, so it has to stay in L2: at a 1024-token chunk, 1024 rows gave 673 tok/s, 2048 gave
-    # 649 and 4096 gave 634 (71 MB at K=17408, past the 64 MB L2). SHAINET_MMQ_SLICE_ROWS overrides.
-    MMQ_SLICE_ROWS = (ENV["SHAINET_MMQ_SLICE_ROWS"]?.try(&.to_i?) || 1024)
+    # the GEMM once per 128-token tile, so it has to stay in L2 (64 MB on the 4090 Laptop), and the
+    # launch should fill the card: with 128x128 tiles a 1024-token chunk is 8 token tiles, and the old
+    # fixed 1024-row slice made 64 blocks for 76 SMs -- every launch left 12 idle. mmq_slice_rows
+    # aims at two full waves instead (19 row tiles = 2432 rows there), capped by scratch size.
+    # Measured at 17.7K tokens: 1024 rows 673 tok/s, 1152 683, 2432 716, 4864 693.
+    # SHAINET_MMQ_SLICE_ROWS forces a fixed size.
+    MMQ_SLICE_ROWS = ENV["SHAINET_MMQ_SLICE_ROWS"]?.try(&.to_i?)
+    MMQ_SLICE_BYTES = 48_i64 * 1024 * 1024
 
     MMQ_TYPES = {GGUF::GGMLType::Q4_K, GGUF::GGMLType::IQ4_XS, GGUF::GGMLType::IQ3_S, GGUF::GGMLType::IQ3_XXS,
                  GGUF::GGMLType::IQ2_XXS, GGUF::GGMLType::IQ2_XS, GGUF::GGMLType::IQ2_S}
@@ -410,10 +415,21 @@ module SHAInet
       end
     end
 
+    private def mmq_slice_rows(m : Int32, k : Int32) : Int32
+      rows = MMQ_SLICE_ROWS || begin
+        m_tiles = (m + 127) // 128
+        want = (2 * CUDA.sm_count + m_tiles - 1) // m_tiles
+        cap = (MMQ_SLICE_BYTES // (k.to_i64 * 128)).to_i32
+        cap = 1 if cap < 1
+        (want < cap ? want : cap) * 128
+      end
+      rows > @cols ? @cols : rows
+    end
+
     # Grow the int8 scratch for an [m, k] input and a slice of this weight. False on allocation failure.
     private def mmq_buffers(m : Int32, k : Int32) : Bool
       nb = (k // 32).to_i64
-      slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
+      slice = mmq_slice_rows(m, k)
       @@mq_w, @@mq_w_elems = GGUFMatrix.grow(@@mq_w, @@mq_w_elems, slice.to_i64 * k)
       @@mq_ws, @@mq_ws_elems = GGUFMatrix.grow(@@mq_ws, @@mq_ws_elems, slice.to_i64 * nb * 2)
       @@mq_wo, @@mq_wo_elems = GGUFMatrix.grow(@@mq_wo, @@mq_wo_elems, slice.to_i64 * nb)
@@ -428,7 +444,7 @@ module SHAInet
       rp = result.device_ptr.not_nil!
       offset = @ggml_type.q4_k?
       s16 = MMQ_S16_TYPES.includes?(@ggml_type)
-      slice = MMQ_SLICE_ROWS > @cols ? @cols : MMQ_SLICE_ROWS
+      slice = mmq_slice_rows(m, k)
       row0 = 0
       while row0 < @cols
         rows = @cols - row0

@@ -16,6 +16,8 @@ module SHAInet
       fun cudaFreeHost(ptr : Pointer(Void)) : Int32
       fun cudaMemGetInfo(free : Pointer(LibC::SizeT), total : Pointer(LibC::SizeT)) : Int32
       fun cudaDeviceSynchronize : Int32
+      fun cudaGetDevice(device : Pointer(Int32)) : Int32
+      fun cudaDeviceGetAttribute(value : Pointer(Int32), attr : Int32, device : Int32) : Int32
     end
 
     @[Link("cublas")]
@@ -176,6 +178,20 @@ module SHAInet
     end
 
     # Returns a hash with free and total memory in bytes for the active CUDA device.
+    @@sm_count : Int32? = nil
+
+    # Streaming multiprocessors on the current device; 1 when it cannot be read.
+    def sm_count : Int32
+      @@sm_count ||= begin
+        dev = 0
+        n = 0
+        # 16 = cudaDevAttrMultiProcessorCount
+        ok = LibCUDARuntime.cudaGetDevice(pointerof(dev)).zero? &&
+             LibCUDARuntime.cudaDeviceGetAttribute(pointerof(n), 16, dev).zero?
+        ok && n > 0 ? n : 1
+      end
+    end
+
     def memory_info
       return unless fully_available?
       free = 0_u64

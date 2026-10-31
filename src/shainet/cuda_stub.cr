@@ -184,6 +184,10 @@ module SHAInet
       false
     end
 
+    def sm_count : Int32
+      1
+    end
+
     def mmq_quantize_x(*args)
       raise "CUDA disabled"
     end
