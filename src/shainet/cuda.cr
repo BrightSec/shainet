@@ -420,6 +420,10 @@ module SHAInet
     @@attention_kv_f16_proc : Proc(Pointer(Float32), Pointer(UInt16), Pointer(UInt16), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
     @@attention_split_kv_f32_proc : Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
     @@attention_split_kv_f16_proc : Proc(Pointer(Float32), Pointer(UInt16), Pointer(UInt16), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
+    @@kv_cache_append_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Int32, Int32, Int32, Int32, Int32, Void)?
+    @@attention_kv_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
+    @@attention_split_kv_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
+    @@kv_fp8_available : Bool? = nil
     @@attention_split_ws_floats_proc : Proc(Int32, Int32, Int32, Int32, Int32)?
 
     def softmax_rows(dst : Pointer(Float32), src : Pointer(Float32), rows : Int32, cols : Int32)
@@ -956,6 +960,24 @@ module SHAInet
       end
       raise "CUDA kernels not available" unless fn
       fn.call(alpha, beta, a_proj, b_proj, a_log, dt_bias, seq, heads)
+    end
+
+    @@gdn_ab_proj_proc : Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32)?
+    @@gdn_ab_proj_checked = false
+
+    # Single-token alpha/beta projections of a Gated DeltaNet layer in one pass (see the kernel).
+    # Returns false when the kernel is missing from the loaded library or could not run, so the
+    # caller falls back to cuBLAS.
+    def gdn_ab_proj(x : Pointer(Float32), wa : Pointer(Float32), wb : Pointer(Float32),
+                    ap : Pointer(Float32), bp : Pointer(Float32), d_model : Int32, heads : Int32) : Bool
+      unless @@gdn_ab_proj_checked
+        @@gdn_ab_proj_checked = true
+        @@gdn_ab_proj_proc = load_kernel_proc("gdn_ab_proj",
+          Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32))
+      end
+      fn = @@gdn_ab_proj_proc
+      return false unless fn
+      fn.call(x, wa, wb, ap, bp, d_model, heads) != 0
     end
 
     # Short causal depthwise convolution, weight[c, 0] being the current position. `state` carries
@@ -1806,6 +1828,61 @@ module SHAInet
         false
       end
       @@kv_f16_available = result
+      result
+    end
+
+    # fp8 (e4m3) KV cache variants: one byte per cached element, half of fp16. Same contracts as the
+    # f16 entry points; the buffers travel as byte pointers.
+    def kv_cache_append_fp8(staging : Pointer(Float32), kc : Pointer(UInt8), vc : Pointer(UInt8),
+                            new_tokens : Int32, start_pos : Int32, num_kv_heads : Int32,
+                            head_dim : Int32, capacity : Int32)
+      unless fn = @@kv_cache_append_fp8_proc
+        @@kv_cache_append_fp8_proc = fn = load_kernel_proc("kv_cache_append_fp8",
+          Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Int32, Int32, Int32, Int32, Int32, Void))
+      end
+      raise "CUDA kernels not available" unless fn
+      fn.call(staging, kc, vc, new_tokens, start_pos, num_kv_heads, head_dim, capacity)
+    end
+
+    def attention_kv_fp8(q : Pointer(Float32), kc : Pointer(UInt8), vc : Pointer(UInt8),
+                         out_ptr : Pointer(Float32), ws : Pointer(Float32),
+                         new_tokens : Int32, start_pos : Int32, num_heads : Int32,
+                         heads_per_kv : Int32, head_dim : Int32, capacity : Int32,
+                         scale : Float32)
+      unless fn = @@attention_kv_fp8_proc
+        @@attention_kv_fp8_proc = fn = load_kernel_proc("attention_kv_fp8",
+          Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32),
+               Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void))
+      end
+      raise "CUDA kernels not available" unless fn
+      fn.call(q, kc, vc, out_ptr, ws, new_tokens, start_pos, num_heads, heads_per_kv, head_dim, capacity, scale)
+    end
+
+    def attention_split_kv_fp8(q : Pointer(Float32), kc : Pointer(UInt8), vc : Pointer(UInt8),
+                               out_ptr : Pointer(Float32), ws : Pointer(Float32),
+                               new_tokens : Int32, start_pos : Int32, num_heads : Int32,
+                               heads_per_kv : Int32, head_dim : Int32, capacity : Int32,
+                               scale : Float32) : Bool
+      unless fn = @@attention_split_kv_fp8_proc
+        @@attention_split_kv_fp8_proc = fn = load_kernel_proc("attention_split_kv_fp8",
+          Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32),
+               Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void))
+      end
+      return false unless fn
+      fn.call(q, kc, vc, out_ptr, ws, new_tokens, start_pos, num_heads,
+        heads_per_kv, head_dim, capacity, scale)
+      true
+    end
+
+    # Whether the loaded kernel library has the fp8 KV kernels. A prebuilt .so from before them
+    # makes an fp8 request fall back to fp16 instead of failing.
+    def kv_fp8_kernels_available? : Bool
+      avail = @@kv_fp8_available
+      return avail unless avail.nil?
+      result = !load_kernel_proc("kv_cache_append_fp8", Proc(Void)).nil? &&
+               !load_kernel_proc("attention_kv_fp8", Proc(Void)).nil? &&
+               !load_kernel_proc("attention_split_kv_fp8", Proc(Void)).nil?
+      @@kv_fp8_available = result
       result
     end
 

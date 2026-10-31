@@ -85,7 +85,7 @@ module SHAInet
     @gpu_v_cache : Pointer(Void) = Pointer(Void).null
     @gpu_cache_cap : Int32 = 0
     # nil until the first device allocation decides the cache dtype.
-    @kv_fp16 : Bool? = nil
+    @kv_dtype : KVDtype? = nil
     # Context budget: when set the device cache is allocated once at exactly this
     # many positions rather than doubling into it. Resolved from
     # SHAINET_KV_MAX_CONTEXT on first read; the checked flag keeps a deliberate
@@ -1410,17 +1410,55 @@ module SHAInet
       avail
     end
 
-    # Whether the device KV cache is kept in fp16. Decided once, at the first
-    # allocation, and then fixed for the lifetime of the buffers so a resize
-    # never has to reinterpret existing contents. Requires the fp16 kernels to
-    # be present in the loaded kernel library (older prebuilt .so files predate
-    # them); opt out with SHAINET_KV_FP16=0.
+    # Storage type of the device KV cache. Arithmetic is fp32 for all three -- the kernels convert on
+    # load -- so only the stored precision and the VRAM it costs differ.
+    enum KVDtype
+      F32
+      F16
+      FP8
+
+      def elem_bytes : UInt64
+        case self
+        in .f32? then 4_u64
+        in .f16? then 2_u64
+        in .fp8? then 1_u64
+        end
+      end
+    end
+
+    # The KV dtype the environment asks for, downgraded to what the loaded kernels support.
+    #
+    # SHAINET_KV_DTYPE=f32|f16|fp8 selects it; without it the older SHAINET_KV_FP16=0 still means
+    # fp32, and the default is fp16. One function rather than a per-caller reading so the loader,
+    # which sizes the VRAM reserve from it, and every block, which allocates from it, cannot disagree.
+    def self.resolve_kv_dtype : KVDtype
+      want = case ENV["SHAINET_KV_DTYPE"]?.try(&.downcase)
+             when "fp8", "f8", "e4m3" then KVDtype::FP8
+             when "f16", "fp16"       then KVDtype::F16
+             when "f32", "fp32"       then KVDtype::F32
+             when nil, ""             then ENV.fetch("SHAINET_KV_FP16", "1") == "0" ? KVDtype::F32 : KVDtype::F16
+             else
+               Log.warn { "unknown SHAINET_KV_DTYPE=#{ENV["SHAINET_KV_DTYPE"]}; using f16" }
+               KVDtype::F16
+             end
+      want = KVDtype::F16 if want.fp8? && !CUDA.kv_fp8_kernels_available?
+      want = KVDtype::F32 if want.f16? && !CUDA.kv_f16_kernels_available?
+      want
+    end
+
+    # Fixed at the first allocation and kept for the buffers' lifetime, so a resize never has to
+    # reinterpret existing contents.
+    def kv_dtype : KVDtype
+      @kv_dtype ||= LlamaBlock.resolve_kv_dtype
+    end
+
+    # Whether the device KV cache is kept in fp16.
     def kv_cache_fp16? : Bool
-      flag = @kv_fp16
-      return flag unless flag.nil?
-      flag = ENV.fetch("SHAINET_KV_FP16", "1") != "0" && CUDA.kv_f16_kernels_available?
-      @kv_fp16 = flag
-      flag
+      kv_dtype.f16?
+    end
+
+    def kv_cache_fp8? : Bool
+      kv_dtype.fp8?
     end
 
     # Current device footprint of this block's KV cache in bytes (K and V), at
@@ -1432,7 +1470,7 @@ module SHAInet
 
     # Bytes per cache element for the active dtype.
     private def kv_elem_bytes : UInt64
-      kv_cache_fp16? ? 2_u64 : 4_u64
+      kv_dtype.elem_bytes
     end
 
     # Ensure the device KV cache holds at least total_len positions per
@@ -1575,11 +1613,16 @@ module SHAInet
     # Dispatch the cache-append kernel for the active cache dtype. Staging is
     # always fp32 and lives at the head of @@gpu_staging.
     private def append_kv(n : Int32, base_pos : Int32)
-      if kv_cache_fp16?
+      case kv_dtype
+      in .fp8?
+        CUDA.kv_cache_append_fp8(@@gpu_staging, @gpu_k_cache.as(Pointer(UInt8)),
+          @gpu_v_cache.as(Pointer(UInt8)), n, base_pos, @num_kv_heads,
+          @head_dim, @gpu_cache_cap)
+      in .f16?
         CUDA.kv_cache_append_f16(@@gpu_staging, @gpu_k_cache.as(Pointer(UInt16)),
           @gpu_v_cache.as(Pointer(UInt16)), n, base_pos, @num_kv_heads,
           @head_dim, @gpu_cache_cap)
-      else
+      in .f32?
         CUDA.kv_cache_append_f32(@@gpu_staging, @gpu_k_cache.as(Pointer(Float32)),
           @gpu_v_cache.as(Pointer(Float32)), n, base_pos, @num_kv_heads,
           @head_dim, @gpu_cache_cap)
@@ -1654,11 +1697,16 @@ module SHAInet
     private def attend_kv(q : Pointer(Float32), n : Int32, base_pos : Int32,
                           heads_per_kv : Int32, scale : Float32)
       if use_split_attn?
-        ok = if kv_cache_fp16?
+        ok = case kv_dtype
+             in .fp8?
+               CUDA.attention_split_kv_fp8(q, @gpu_k_cache.as(Pointer(UInt8)),
+                 @gpu_v_cache.as(Pointer(UInt8)), @@gpu_attn_out, @@gpu_attn_ws,
+                 n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
+             in .f16?
                CUDA.attention_split_kv_f16(q, @gpu_k_cache.as(Pointer(UInt16)),
                  @gpu_v_cache.as(Pointer(UInt16)), @@gpu_attn_out, @@gpu_attn_ws,
                  n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
-             else
+             in .f32?
                CUDA.attention_split_kv_f32(q, @gpu_k_cache.as(Pointer(Float32)),
                  @gpu_v_cache.as(Pointer(Float32)), @@gpu_attn_out, @@gpu_attn_ws,
                  n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
@@ -1670,11 +1718,16 @@ module SHAInet
         return
       end
 
-      if kv_cache_fp16?
+      case kv_dtype
+      in .fp8?
+        CUDA.attention_kv_fp8(q, @gpu_k_cache.as(Pointer(UInt8)),
+          @gpu_v_cache.as(Pointer(UInt8)), @@gpu_attn_out, @@gpu_attn_ws,
+          n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
+      in .f16?
         CUDA.attention_kv_f16(q, @gpu_k_cache.as(Pointer(UInt16)),
           @gpu_v_cache.as(Pointer(UInt16)), @@gpu_attn_out, @@gpu_attn_ws,
           n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
-      else
+      in .f32?
         CUDA.attention_kv_f32(q, @gpu_k_cache.as(Pointer(Float32)),
           @gpu_v_cache.as(Pointer(Float32)), @@gpu_attn_out, @@gpu_attn_ws,
           n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)

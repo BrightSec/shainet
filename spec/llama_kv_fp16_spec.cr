@@ -45,6 +45,20 @@ private def with_kv_fp16(value : String, &)
   end
 end
 
+private def with_kv_dtype(value : String, &)
+  prev = ENV["SHAINET_KV_DTYPE"]?
+  ENV["SHAINET_KV_DTYPE"] = value
+  begin
+    yield
+  ensure
+    if prev
+      ENV["SHAINET_KV_DTYPE"] = prev
+    else
+      ENV.delete("SHAINET_KV_DTYPE")
+    end
+  end
+end
+
 # Prefill then a few decode steps, returning every output.
 private def drive(blk : SHAInet::LlamaBlock, prompt : SHAInet::SimpleMatrix,
                   steps : Array(SHAInet::SimpleMatrix)) : Array(SHAInet::SimpleMatrix)
@@ -88,6 +102,37 @@ describe "LlamaBlock fp16 KV cache" do
 
     fp32_blk.kv_cache_bytes.should be > 0
     fp16_blk.kv_cache_bytes.should eq(fp32_blk.kv_cache_bytes // 2)
+  end
+
+  it "fp8 KV tracks the fp32 result at a quarter of the footprint" do
+    pending! "CUDA kernels not available" unless SHAInet::CUDA.fully_available?
+    pending! "fp8 KV kernels not in the loaded library" unless SHAInet::CUDA.kv_fp8_kernels_available?
+
+    d_model = 64
+    seq = 24
+    prng = Random.new(9)
+    prompt = SHAInet::SimpleMatrix.new(seq, d_model)
+    seq.times { |r| d_model.times { |c| prompt[r, c] = (prng.rand * 2.0 - 1.0) } }
+    steps = Array.new(3) do
+      tok = SHAInet::SimpleMatrix.new(1, d_model)
+      d_model.times { |c| tok[0, c] = (prng.rand * 2.0 - 1.0) }
+      tok
+    end
+
+    fp32_blk = build_block(Random.new(42), d_model)
+    fp32_outs = with_kv_fp16("0") { drive(fp32_blk, prompt, steps) }
+
+    fp8_blk = build_block(Random.new(42), d_model)
+    fp8_outs = with_kv_dtype("fp8") { drive(fp8_blk, prompt, steps) }
+    fp8_blk.kv_cache_fp8?.should be_true
+
+    # e4m3 keeps 3 mantissa bits, so the bound is looser than fp16's, but still far below the
+    # activations' scale: a broken store or load would miss it by orders of magnitude.
+    fp32_outs.each_with_index do |expected, i|
+      max_abs_diff(expected, fp8_outs[i]).should be < 5e-2
+    end
+
+    fp8_blk.kv_cache_bytes.should eq(fp32_blk.kv_cache_bytes // 4)
   end
 
   it "stays correct through a device cache growth" do

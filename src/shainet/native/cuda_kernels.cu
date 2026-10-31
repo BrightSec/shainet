@@ -1,5 +1,6 @@
 #include <curand_kernel.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cstdio>
 #include <cstdlib>
 #include "iq_tables.cuh"  // i-quant codebook grids in constant memory
@@ -381,29 +382,59 @@ void swiglu_forward(float* hidden, const float* gate, const float* up, int size)
 // check is that greedy decoding still picks the same tokens.
 __global__ void rms_norm_forward_kernel(float* out, const float* x, const float* gamma,
                                         int rows, int cols, float eps) {
-    extern __shared__ float sdata[];
+    // One block per row. At decode that is ONE block for the whole norm, so the kernel is pure
+    // latency: the original scalar loads and an eight-step halving reduction with a __syncthreads
+    // each took ~17 us for a 5120-wide row, 128 times a token. float4 loads (when the row allows),
+    // up to 1024 threads, and a warp-shuffle reduction bring it to a few microseconds.
+    __shared__ float warp_sums[32];
     int row = blockIdx.x;
     if (row >= rows) return;
 
     const float* xr = x + (size_t)row * (size_t)cols;
     float* orow = out + (size_t)row * (size_t)cols;
+    const bool vec = (cols & 3) == 0;
 
     float local = 0.0f;
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
-        float v = xr[j];
-        local += v * v;
+    if (vec) {
+        const float4* x4 = (const float4*)xr;
+        for (int j = threadIdx.x; j < (cols >> 2); j += blockDim.x) {
+            float4 v = x4[j];
+            local += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+    } else {
+        for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+            float v = xr[j];
+            local += v * v;
+        }
     }
-    sdata[threadIdx.x] = local;
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) local += __shfl_down_sync(0xFFFFFFFF, local, s);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = local;
+    __syncthreads();
+    if (warp == 0) {
+        const int nwarps = (blockDim.x + 31) >> 5;
+        float t = lane < nwarps ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) t += __shfl_down_sync(0xFFFFFFFF, t, s);
+        if (lane == 0) warp_sums[0] = t;
+    }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-
-    float inv = 1.0f / sqrtf(sdata[0] / (float)cols + eps);
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
-        orow[j] = xr[j] * inv * gamma[j];
+    float inv = 1.0f / sqrtf(warp_sums[0] / (float)cols + eps);
+    if (vec) {
+        const float4* x4 = (const float4*)xr;
+        const float4* g4 = (const float4*)gamma;
+        float4* o4 = (float4*)orow;
+        for (int j = threadIdx.x; j < (cols >> 2); j += blockDim.x) {
+            float4 v = x4[j], g = g4[j];
+            o4[j] = make_float4(v.x * inv * g.x, v.y * inv * g.y, v.z * inv * g.z, v.w * inv * g.w);
+        }
+    } else {
+        for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+            orow[j] = xr[j] * inv * gamma[j];
+        }
     }
 }
 
@@ -442,11 +473,11 @@ void scatter_add_rows(float* dst, const float* src, const int* idx,
 // default stream between the launches that produce and consume the row.
 void rms_norm_forward(float* out, const float* x, const float* gamma,
                       int rows, int cols, float eps) {
-    int threads_per_block = 256;
-    // Power-of-two thread count is required by the halving reduction above.
-    size_t shmem = threads_per_block * sizeof(float);
+    // Wide blocks only when a row is wide enough to use them: with many rows (prefill) the grid
+    // already fills the card, and with one row (decode) the threads are the only parallelism.
+    int threads_per_block = (rows <= 8 && cols >= 4096) ? 1024 : 256;
 
-    rms_norm_forward_kernel<<<rows, threads_per_block, shmem>>>(out, x, gamma, rows, cols, eps);
+    rms_norm_forward_kernel<<<rows, threads_per_block>>>(out, x, gamma, rows, cols, eps);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error in rms_norm_forward: %s\n", cudaGetErrorString(err));
@@ -1302,6 +1333,14 @@ template <> struct KVStore<__half> {
     __device__ static inline float load(const __half* p, long i) { return __half2float(p[i]); }
     __device__ static inline void store(__half* p, long i, float v) { p[i] = __float2half(v); }
 };
+// fp8 e4m3, unscaled (vLLM's default fp8 KV mode). Half the bytes of fp16, which at long context is
+// the difference between ~2 GB and ~4 GB of VRAM for a 16-attention-layer 27B at 64K -- about eight
+// more layers resident. The store saturates at +-448 rather than producing inf, and K arrives here
+// after q/k-norm and RoPE, so its range sits comfortably inside that.
+template <> struct KVStore<__nv_fp8_e4m3> {
+    __device__ static inline float load(const __nv_fp8_e4m3* p, long i) { return float(p[i]); }
+    __device__ static inline void store(__nv_fp8_e4m3* p, long i, float v) { p[i] = __nv_fp8_e4m3(v); }
+};
 
 // `staging` holds the newly appended rows, already RoPE'd (K) on the host:
 //   [num_kv_heads * new_tokens * head_dim] K chunks (kv_head-major, then
@@ -1363,6 +1402,25 @@ void kv_cache_append_f16(const float* staging, unsigned short* kc, unsigned shor
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error in kv_cache_append_f16: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// fp8 (e4m3) cache variant. `kc`/`vc` travel from Crystal as byte pointers.
+void kv_cache_append_fp8(const float* staging, unsigned char* kc, unsigned char* vc,
+                         int new_tokens, int start_pos, int num_kv_heads,
+                         int head_dim, int capacity) {
+    int total = 2 * num_kv_heads * new_tokens * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    kv_cache_append_kernel_t<__nv_fp8_e4m3><<<blocks, threads>>>(staging,
+                                                                 reinterpret_cast<__nv_fp8_e4m3*>(kc),
+                                                                 reinterpret_cast<__nv_fp8_e4m3*>(vc),
+                                                                 new_tokens, start_pos,
+                                                                 num_kv_heads, head_dim,
+                                                                 capacity);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in kv_cache_append_fp8: %s\n", cudaGetErrorString(err));
     }
 }
 
@@ -1675,6 +1733,16 @@ void attention_split_kv_f16(const float* q, const unsigned short* kc, const unsi
                                       num_heads, heads_per_kv, head_dim, capacity, scale);
 }
 
+void attention_split_kv_fp8(const float* q, const unsigned char* kc, const unsigned char* vc,
+                            float* out, float* ws, int new_tokens, int start_pos,
+                            int num_heads, int heads_per_kv, int head_dim,
+                            int capacity, float scale) {
+    attention_split_kv_launch<__nv_fp8_e4m3>(q, reinterpret_cast<const __nv_fp8_e4m3*>(kc),
+                                             reinterpret_cast<const __nv_fp8_e4m3*>(vc),
+                                             out, ws, new_tokens, start_pos,
+                                             num_heads, heads_per_kv, head_dim, capacity, scale);
+}
+
 void attention_kv_f32(const float* q, const float* kc, const float* vc,
                       float* out, float* ws, int new_tokens, int start_pos,
                       int num_heads, int heads_per_kv, int head_dim,
@@ -1712,6 +1780,26 @@ void attention_kv_f16(const float* q, const unsigned short* kc, const unsigned s
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error in attention_kv_f16: %s\n", cudaGetErrorString(err));
+    }
+}
+
+void attention_kv_fp8(const float* q, const unsigned char* kc, const unsigned char* vc,
+                      float* out, float* ws, int new_tokens, int start_pos,
+                      int num_heads, int heads_per_kv, int head_dim,
+                      int capacity, float scale) {
+    int threads = 128;
+    dim3 grid(num_heads, new_tokens);
+    size_t shmem = (head_dim + threads) * sizeof(float);
+    attention_kv_kernel_t<__nv_fp8_e4m3><<<grid, threads, shmem>>>(q,
+                                                                   reinterpret_cast<const __nv_fp8_e4m3*>(kc),
+                                                                   reinterpret_cast<const __nv_fp8_e4m3*>(vc),
+                                                                   out, ws,
+                                                                   new_tokens, start_pos,
+                                                                   num_heads, heads_per_kv,
+                                                                   head_dim, capacity, scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in attention_kv_fp8: %s\n", cudaGetErrorString(err));
     }
 }
 
@@ -1966,6 +2054,50 @@ __device__ __forceinline__ float iq4nl_val(int idx) {
 
 #include "iq_lowbit_kernels.cuh"
 
+// Shared shape of the IQ3 GEMVs below (and of the low-bit GEMVs in iq_lowbit_kernels.cuh).
+//
+// One warp per output row as before, but the grid is PERSISTENT: about six 16-warp blocks per SM,
+// and each warp walks rows with a grid stride. The codebook is staged into shared memory once per
+// resident block rather than once per four rows -- at 4 rows per block that staging was ~23% extra
+// L2 traffic on a K=5120 projection, plus a __syncthreads per four rows.
+//
+// The inner loop also loads wider (the lane's two grid indices as one u16, its eight activations as
+// two float4) and is unrolled so several blocks' loads are in flight per lane. Each iteration is a
+// short chain of dependent loads -- weight bytes, then the codebook entry they index -- so the
+// rolled loop left the kernel latency-bound. Measured at the 27B's real shapes: IQ3_S 147 -> 350-400
+// GB/s, IQ3_XXS 120-129 -> 310-350 GB/s, i.e. 2.2-2.8x, results equal to fp32 reassociation.
+#define IQ_GEMV_WARPS 16
+#define IQ_GEMV_BLOCKS_PER_SM 6
+
+static int iq_gemv_grid(int rows) {
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 1;
+    }
+    int blocks = sms * IQ_GEMV_BLOCKS_PER_SM;
+    int need = (rows + IQ_GEMV_WARPS - 1) / IQ_GEMV_WARPS;
+    return blocks < need ? blocks : need;
+}
+
+// Sum of eight codebook values with their signs applied, against eight activations. `g1`/`g2` each
+// pack four unsigned magnitudes; bit j of `sg` negates value j.
+__device__ __forceinline__ float iq3_dot8(unsigned int g1, unsigned int g2, unsigned int sg,
+                                          float4 xa, float4 xb) {
+    float s = 0.0f;
+    s += (float)((g1      ) & 0xff) * ((sg & 0x01) ? -xa.x : xa.x);
+    s += (float)((g1 >>  8) & 0xff) * ((sg & 0x02) ? -xa.y : xa.y);
+    s += (float)((g1 >> 16) & 0xff) * ((sg & 0x04) ? -xa.z : xa.z);
+    s += (float)((g1 >> 24)       ) * ((sg & 0x08) ? -xa.w : xa.w);
+    s += (float)((g2      ) & 0xff) * ((sg & 0x10) ? -xb.x : xb.x);
+    s += (float)((g2 >>  8) & 0xff) * ((sg & 0x20) ? -xb.y : xb.y);
+    s += (float)((g2 >> 16) & 0xff) * ((sg & 0x40) ? -xb.z : xb.z);
+    s += (float)((g2 >> 24)       ) * ((sg & 0x80) ? -xb.w : xb.w);
+    return s;
+}
+
 __global__ void gemv_iq3xxs_kernel(const float* __restrict__ x,
                                    const unsigned char* __restrict__ w,
                                    float* __restrict__ y,
@@ -1975,55 +2107,47 @@ __global__ void gemv_iq3xxs_kernel(const float* __restrict__ x,
     // Constant memory serves a warp best when all 32 lanes read the same address; a codebook lookup
     // indexed by packed weight bits is the opposite, so every lane wants a different entry and the
     // access serializes. Shared memory is banked and satisfies a divergent read per bank per cycle.
-    // This grid is 1 KB and the sign table 128 B, so the whole codebook is staged once per block and
-    // amortized over every row that block computes.
     __shared__ unsigned int s_grid[256];
     __shared__ unsigned char s_ksigns[128];
     for (int i = threadIdx.x; i < 256; i += blockDim.x) s_grid[i] = d_iq3xxs_grid[i];
     for (int i = threadIdx.x; i < 128; i += blockDim.x) s_ksigns[i] = d_ksigns_iq2xs[i];
     __syncthreads();
 
-    const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * (blockDim.x >> 5) + warp;
+    const int wpb = blockDim.x >> 5;
     const int m = blockIdx.y;
-    if (n >= N || m >= M) return;
+    if (m >= M) return;
 
     const int nblocks = K / GGUF_QK_K;
     const long row_bytes = (long)nblocks * GGUF_IQ3XXS_BLOCK_BYTES;
-    const unsigned char* wrow = w + (long)n * row_bytes;
     const float* xrow = x + (long)m * K;
 
     // Lane l handles group l of 32: sub-block ib32 = l/4, position within it lpos = l%4.
     const int ib32 = lane >> 2;
     const int lpos = lane & 3;
 
-    float acc = 0.0f;
-    for (int b = 0; b < nblocks; ++b) {
-        const unsigned char* block = wrow + (long)b * GGUF_IQ3XXS_BLOCK_BYTES;
-        const float d = __half2float(*((const __half*)(block + 0)));
-        const unsigned char* qs = block + 2;
-        const unsigned char* sas = qs + 64;   // scales_and_signs, eight uint32
-
-        unsigned int aux32;
-        memcpy(&aux32, sas + 4 * ib32, sizeof(unsigned int));
-        const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
-        const unsigned char signs = s_ksigns[(aux32 >> (7 * lpos)) & 127];
-
-        const unsigned char* g1 = (const unsigned char*)(s_grid + qs[8 * ib32 + 2 * lpos + 0]);
-        const unsigned char* g2 = (const unsigned char*)(s_grid + qs[8 * ib32 + 2 * lpos + 1]);
-        const float* xp = xrow + b * GGUF_QK_K + ib32 * 32 + lpos * 8;
-
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            acc += db * (float)g1[j] * ((signs & (1u << (j + 0))) ? -1.0f : 1.0f) * xp[j + 0];
-            acc += db * (float)g2[j] * ((signs & (1u << (j + 4))) ? -1.0f : 1.0f) * xp[j + 4];
+    for (int n = blockIdx.x * wpb + (threadIdx.x >> 5); n < N; n += gridDim.x * wpb) {
+        const unsigned char* wrow = w + (long)n * row_bytes;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int b = 0; b < nblocks; ++b) {
+            const unsigned char* block = wrow + (long)b * GGUF_IQ3XXS_BLOCK_BYTES;
+            const float d = __half2float(*((const __half*)(block + 0)));
+            const unsigned char* qs = block + 2;
+            // The 98-byte block stride only guarantees 2-byte alignment, so the scales-and-signs
+            // word is assembled from two u16 loads.
+            const unsigned short* sp = (const unsigned short*)(qs + 64 + 4 * ib32);
+            const unsigned int aux32 = (unsigned int)sp[0] | ((unsigned int)sp[1] << 16);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            const unsigned int sg = s_ksigns[(aux32 >> (7 * lpos)) & 127];
+            const unsigned short q2 = *((const unsigned short*)(qs + 8 * ib32 + 2 * lpos));
+            const float4* xp = (const float4*)(xrow + b * GGUF_QK_K + ib32 * 32 + lpos * 8);
+            acc += db * iq3_dot8(s_grid[q2 & 0xff], s_grid[q2 >> 8], sg, xp[0], xp[1]);
         }
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);
+        if (lane == 0) y[(long)m * N + n] = acc;
     }
-
-    #pragma unroll
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);
-    if (lane == 0) y[(long)m * N + n] = acc;
 }
 
 __global__ void gemv_iq3s_kernel(const float* __restrict__ x,
@@ -2036,68 +2160,62 @@ __global__ void gemv_iq3s_kernel(const float* __restrict__ x,
     for (int i = threadIdx.x; i < 512; i += blockDim.x) s_grid[i] = d_iq3s_grid[i];
     __syncthreads();
 
-    const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * (blockDim.x >> 5) + warp;
+    const int wpb = blockDim.x >> 5;
     const int m = blockIdx.y;
-    if (n >= N || m >= M) return;
+    if (m >= M) return;
 
     const int nblocks = K / GGUF_QK_K;
     const long row_bytes = (long)nblocks * GGUF_IQ3S_BLOCK_BYTES;
-    const unsigned char* wrow = w + (long)n * row_bytes;
     const float* xrow = x + (long)m * K;
 
     const int ib32 = lane >> 2;   // which 32-value sub-block
     const int lpos = lane & 3;    // group of 8 within it
 
-    float acc = 0.0f;
-    for (int b = 0; b < nblocks; ++b) {
-        const unsigned char* block = wrow + (long)b * GGUF_IQ3S_BLOCK_BYTES;
-        const float d = __half2float(*((const __half*)(block + 0)));
-        const unsigned char* qs = block + 2;
-        const unsigned char* qh = block + 2 + 64;
-        const unsigned char* signs = block + 2 + 64 + 8;
-        const unsigned char* scales = block + 2 + 64 + 8 + 32;
+    for (int n = blockIdx.x * wpb + (threadIdx.x >> 5); n < N; n += gridDim.x * wpb) {
+        const unsigned char* wrow = w + (long)n * row_bytes;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int b = 0; b < nblocks; ++b) {
+            const unsigned char* block = wrow + (long)b * GGUF_IQ3S_BLOCK_BYTES;
+            const float d = __half2float(*((const __half*)(block + 0)));
+            const unsigned char* qs = block + 2;
+            const unsigned char* qh = block + 2 + 64;
+            const unsigned char* signs = block + 2 + 64 + 8;
+            const unsigned char* scales = block + 2 + 64 + 8 + 32;
 
-        // The reference walks ib32 in steps of two, taking the low nibble of scales[ib32/2] for the
-        // even sub-block and the high nibble for the odd one, and reads qh[ib32] for its ninth
-        // index bit. Expressed per-lane that is just: pick the nibble by parity.
-        const int ls = (ib32 & 1) ? (scales[ib32 >> 1] >> 4) : (scales[ib32 >> 1] & 0xf);
-        const float db = d * (1 + 2 * ls);
-        const unsigned char sg = signs[4 * ib32 + lpos];
-        const unsigned char qhb = qh[ib32];
-
-        const int i1 = qs[8 * ib32 + 2 * lpos + 0] | ((qhb << (8 - 2 * lpos)) & 256);
-        const int i2 = qs[8 * ib32 + 2 * lpos + 1] | ((qhb << (7 - 2 * lpos)) & 256);
-        const unsigned char* g1 = (const unsigned char*)(s_grid + i1);
-        const unsigned char* g2 = (const unsigned char*)(s_grid + i2);
-        const float* xp = xrow + b * GGUF_QK_K + ib32 * 32 + lpos * 8;
-
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            acc += db * (float)g1[j] * ((sg & (1u << (j + 0))) ? -1.0f : 1.0f) * xp[j + 0];
-            acc += db * (float)g2[j] * ((sg & (1u << (j + 4))) ? -1.0f : 1.0f) * xp[j + 4];
+            // The reference walks ib32 in steps of two, taking the low nibble of scales[ib32/2] for
+            // the even sub-block and the high nibble for the odd one, and reads qh[ib32] for its
+            // ninth index bit. Expressed per-lane that is just: pick the nibble by parity.
+            const int ls = (scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0xf;
+            const float db = d * (1 + 2 * ls);
+            const unsigned int sg = signs[4 * ib32 + lpos];
+            const unsigned int qhb = qh[ib32];
+            const unsigned short q2 = *((const unsigned short*)(qs + 8 * ib32 + 2 * lpos));
+            const int i1 = (q2 & 0xff) | ((qhb << (8 - 2 * lpos)) & 256);
+            const int i2 = (q2 >> 8) | ((qhb << (7 - 2 * lpos)) & 256);
+            const float4* xp = (const float4*)(xrow + b * GGUF_QK_K + ib32 * 32 + lpos * 8);
+            acc += db * iq3_dot8(s_grid[i1], s_grid[i2], sg, xp[0], xp[1]);
         }
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);
+        if (lane == 0) y[(long)m * N + n] = acc;
     }
-
-    #pragma unroll
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);
-    if (lane == 0) y[(long)m * N + n] = acc;
 }
 
+// Persistent grid with a grid-stride over rows and an unrolled block loop, like the IQ3 kernels
+// (see iq_gemv_grid): more loads in flight per lane for a loop whose body is short.
 __global__ void gemv_iq4xs_kernel(const float* __restrict__ x,
                                   const unsigned char* __restrict__ w,
                                   float* __restrict__ y,
                                   int M, int N, int K) {
-    const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * (blockDim.x >> 5) + warp;
+    const int wpb = blockDim.x >> 5;
     const int m = blockIdx.y;
-    if (n >= N || m >= M) return;
+    if (m >= M) return;
 
     const int nblocks = K / GGUF_QK_K;
     const long row_bytes = (long)nblocks * GGUF_IQ4XS_BLOCK_BYTES;
-    const unsigned char* wrow = w + (long)n * row_bytes;
     const float* xrow = x + (long)m * K;
 
     // 32 lanes x 4 bytes covers the whole 128-byte qs, each byte read exactly once.
@@ -2107,35 +2225,37 @@ __global__ void gemv_iq4xs_kernel(const float* __restrict__ x,
     const int vlo = ib * 32 + off; // first low-nibble value
     const int vhi = vlo + 16;      // matching high-nibble value
 
-    float acc = 0.0f;
-    for (int b = 0; b < nblocks; ++b) {
-        const unsigned char* block = wrow + (long)b * GGUF_IQ4XS_BLOCK_BYTES;
-        const float d = __half2float(*((const __half*)(block + 0)));
-        const unsigned short scales_h = *((const unsigned short*)(block + 2));
-        const unsigned char* scales_l = block + 4;
+    for (int n = blockIdx.x * wpb + (threadIdx.x >> 5); n < N; n += gridDim.x * wpb) {
+        const unsigned char* wrow = w + (long)n * row_bytes;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int b = 0; b < nblocks; ++b) {
+            const unsigned char* block = wrow + (long)b * GGUF_IQ4XS_BLOCK_BYTES;
+            const float d = __half2float(*((const __half*)(block + 0)));
+            const unsigned short scales_h = *((const unsigned short*)(block + 2));
+            const unsigned char* scales_l = block + 4;
 
-        const int ls = ((scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
-        const float dl = d * (float)(ls - 32);
+            const int ls = ((scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * (float)(ls - 32);
 
-        const uchar4 q = *((const uchar4*)(block + 8 + b0));
-        const float* xl = xrow + b * GGUF_QK_K + vlo;
-        const float* xh = xrow + b * GGUF_QK_K + vhi;
-        const float4 xlo = *((const float4*)xl);
-        const float4 xhi = *((const float4*)xh);
+            const uchar4 q = *((const uchar4*)(block + 8 + b0));
+            const float4 xlo = *((const float4*)(xrow + b * GGUF_QK_K + vlo));
+            const float4 xhi = *((const float4*)(xrow + b * GGUF_QK_K + vhi));
 
-        acc += dl * iq4nl_val(q.x & 0xF) * xlo.x;
-        acc += dl * iq4nl_val(q.y & 0xF) * xlo.y;
-        acc += dl * iq4nl_val(q.z & 0xF) * xlo.z;
-        acc += dl * iq4nl_val(q.w & 0xF) * xlo.w;
-        acc += dl * iq4nl_val(q.x >> 4) * xhi.x;
-        acc += dl * iq4nl_val(q.y >> 4) * xhi.y;
-        acc += dl * iq4nl_val(q.z >> 4) * xhi.z;
-        acc += dl * iq4nl_val(q.w >> 4) * xhi.w;
+            float s = iq4nl_val(q.x & 0xF) * xlo.x;
+            s += iq4nl_val(q.y & 0xF) * xlo.y;
+            s += iq4nl_val(q.z & 0xF) * xlo.z;
+            s += iq4nl_val(q.w & 0xF) * xlo.w;
+            s += iq4nl_val(q.x >> 4) * xhi.x;
+            s += iq4nl_val(q.y >> 4) * xhi.y;
+            s += iq4nl_val(q.z >> 4) * xhi.z;
+            s += iq4nl_val(q.w >> 4) * xhi.w;
+            acc += dl * s;
+        }
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);
+        if (lane == 0) y[(long)m * N + n] = acc;
     }
-
-    #pragma unroll
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);
-    if (lane == 0) y[(long)m * N + n] = acc;
 }
 
 // Dequantize IQ4_XS rows to fp32 for the batched GEMM path.
@@ -2600,6 +2720,74 @@ void gdn_gates(float* alpha, float* beta, const float* a_proj, const float* b_pr
         alpha, beta, a_proj, b_proj, a_log, dt_bias, seq, heads);
 }
 
+// Decode-time alpha/beta projections of a Gated DeltaNet layer, both in one pass.
+//
+//   ap[h] = sum_k wa[k, h] * x[k],  bp[h] = sum_k wb[k, h] * x[k]
+//
+// with the weights row-major [d_model, heads] as loaded. These were two cuBLAS sgemm calls, which at
+// one token and 48 heads land on a gemv kernel that measured ~31 us each -- ~32 GB/s on a 1 MB
+// weight, 96 calls and ~3 ms per token across the stack. Here K is split into chunks, one block per
+// (chunk, alpha|beta), with heads across the threads so each k reads one contiguous row of the
+// weight. The chunk partials are then summed in a fixed order by a second tiny kernel: no atomics,
+// so the result is identical run to run.
+#define GDN_AB_KCHUNK 128
+
+__global__ void gdn_ab_proj_partial_kernel(const float* __restrict__ x,
+                                           const float* __restrict__ wa,
+                                           const float* __restrict__ wb,
+                                           float* __restrict__ partial,
+                                           int d_model, int heads) {
+    const int c = blockIdx.x;
+    const int z = blockIdx.y;
+    const float* W = z ? wb : wa;
+    const int k0 = c * GDN_AB_KCHUNK;
+    const int k1 = min(k0 + GDN_AB_KCHUNK, d_model);
+    for (int h = threadIdx.x; h < heads; h += blockDim.x) {
+        float acc = 0.0f;
+        #pragma unroll 8
+        for (int k = k0; k < k1; ++k) acc += W[(long)k * heads + h] * x[k];
+        partial[((long)z * gridDim.x + c) * heads + h] = acc;
+    }
+}
+
+__global__ void gdn_ab_proj_reduce_kernel(const float* __restrict__ partial,
+                                          float* __restrict__ ap, float* __restrict__ bp,
+                                          int nch, int heads) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 2 * heads) return;
+    const int z = i / heads;
+    const int h = i - z * heads;
+    float acc = 0.0f;
+    for (int c = 0; c < nch; ++c) acc += partial[((long)z * nch + c) * heads + h];
+    (z ? bp : ap)[h] = acc;
+}
+
+// Returns 0 when it cannot run (its scratch could not be allocated), so the caller keeps cuBLAS.
+int gdn_ab_proj(const float* x, const float* wa, const float* wb, float* ap, float* bp,
+                int d_model, int heads) {
+    static float* partial = nullptr;
+    static size_t partial_floats = 0;
+    if (d_model <= 0 || heads <= 0) return 0;
+    const int nch = (d_model + GDN_AB_KCHUNK - 1) / GDN_AB_KCHUNK;
+    const size_t need = (size_t)2 * nch * heads;
+    if (need > partial_floats) {
+        if (partial) cudaFree(partial);
+        partial = nullptr;
+        partial_floats = 0;
+        if (cudaMalloc(&partial, need * sizeof(float)) != cudaSuccess) return 0;
+        partial_floats = need;
+    }
+    const int threads = heads <= 32 ? 32 : (heads <= 64 ? 64 : 128);
+    gdn_ab_proj_partial_kernel<<<dim3(nch, 2), threads>>>(x, wa, wb, partial, d_model, heads);
+    gdn_ab_proj_reduce_kernel<<<(2 * heads + 127) / 128, 128>>>(partial, ap, bp, nch, heads);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in gdn_ab_proj: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+
 // Fused causal conv (+ optional SiLU) for q, k and v in two launches instead of nine.
 void short_conv_silu3(float* d0, const float* s0, float* st0, const float* w0,
                       float* d1, const float* s1, float* st1, const float* w1,
@@ -2784,10 +2972,8 @@ void dequant_iq3s_rows(const unsigned char* w, float* out, int row0, int n_rows,
 
 void gemv_q2k_lb(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
     if (N <= 0 || M <= 0 || K <= 0) return;
-    int threads = 256;
-    int rows_per_block = threads / 32;
-    dim3 grid((N + rows_per_block - 1) / rows_per_block, M);
-    gemv_q2k_lb_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_q2k_lb_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
 }
 
 void dequant_q2k_lb_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
@@ -2800,10 +2986,8 @@ void dequant_q2k_lb_rows(const unsigned char* w, float* out, int row0, int n_row
 
 void gemv_iq2xxs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
     if (N <= 0 || M <= 0 || K <= 0) return;
-    int threads = 256;
-    int rows_per_block = threads / 32;
-    dim3 grid((N + rows_per_block - 1) / rows_per_block, M);
-    gemv_iq2xxs_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq2xxs_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
 }
 
 void dequant_iq2xxs_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
@@ -2816,10 +3000,8 @@ void dequant_iq2xxs_rows(const unsigned char* w, float* out, int row0, int n_row
 
 void gemv_iq2xs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
     if (N <= 0 || M <= 0 || K <= 0) return;
-    int threads = 256;
-    int rows_per_block = threads / 32;
-    dim3 grid((N + rows_per_block - 1) / rows_per_block, M);
-    gemv_iq2xs_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq2xs_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
 }
 
 void dequant_iq2xs_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
@@ -2832,10 +3014,8 @@ void dequant_iq2xs_rows(const unsigned char* w, float* out, int row0, int n_rows
 
 void gemv_iq2s(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
     if (N <= 0 || M <= 0 || K <= 0) return;
-    int threads = 256;
-    int rows_per_block = threads / 32;
-    dim3 grid((N + rows_per_block - 1) / rows_per_block, M);
-    gemv_iq2s_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq2s_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
 }
 
 void dequant_iq2s_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
@@ -2848,10 +3028,8 @@ void dequant_iq2s_rows(const unsigned char* w, float* out, int row0, int n_rows,
 
 void gemv_iq1m(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
     if (N <= 0 || M <= 0 || K <= 0) return;
-    int threads = 256;
-    int rows_per_block = threads / 32;
-    dim3 grid((N + rows_per_block - 1) / rows_per_block, M);
-    gemv_iq1m_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq1m_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
 }
 
 void dequant_iq1m_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
@@ -2864,10 +3042,8 @@ void dequant_iq1m_rows(const unsigned char* w, float* out, int row0, int n_rows,
 
 void gemv_iq1s(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
     if (N <= 0 || M <= 0 || K <= 0) return;
-    int threads = 256;
-    int rows_per_block = threads / 32;
-    dim3 grid((N + rows_per_block - 1) / rows_per_block, M);
-    gemv_iq1s_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq1s_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
 }
 
 void dequant_iq1s_rows(const unsigned char* w, float* out, int row0, int n_rows, int K) {
@@ -2879,29 +3055,22 @@ void dequant_iq1s_rows(const unsigned char* w, float* out, int row0, int n_rows,
 }
 
 void gemv_iq3xxs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
-    const int warps = 4;
-    const int threads = warps * 32;
-    dim3 grid((N + warps - 1) / warps, M);
-    gemv_iq3xxs_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq3xxs_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) printf("CUDA Error in gemv_iq3xxs: %s\n", cudaGetErrorString(err));
 }
 
 void gemv_iq3s(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
-    const int warps = 4;
-    const int threads = warps * 32;
-    dim3 grid((N + warps - 1) / warps, M);
-    gemv_iq3s_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq3s_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) printf("CUDA Error in gemv_iq3s: %s\n", cudaGetErrorString(err));
 }
 
 void gemv_iq4xs(const float* x, const unsigned char* w, float* y, int M, int N, int K) {
-    // One warp per output row, 4 warps per block, shuffle reduction -- same shape as gemv_q4k.
-    const int warps = 4;
-    const int threads = warps * 32;
-    dim3 grid((N + warps - 1) / warps, M);
-    gemv_iq4xs_kernel<<<grid, threads>>>(x, w, y, M, N, K);
+    dim3 grid(iq_gemv_grid(N), M);
+    gemv_iq4xs_kernel<<<grid, IQ_GEMV_WARPS * 32>>>(x, w, y, M, N, K);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error in gemv_iq4xs: %s\n", cudaGetErrorString(err));

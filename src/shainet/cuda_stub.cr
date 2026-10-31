@@ -139,6 +139,26 @@ module SHAInet
       false
     end
 
+    def kv_cache_append_fp8(*args)
+      raise "CUDA disabled"
+    end
+
+    def attention_kv_fp8(*args)
+      raise "CUDA disabled"
+    end
+
+    def attention_split_kv_fp8(q : Pointer(Float32), kc : Pointer(UInt8), vc : Pointer(UInt8),
+                               out_ptr : Pointer(Float32), ws : Pointer(Float32),
+                               new_tokens : Int32, start_pos : Int32, num_heads : Int32,
+                               heads_per_kv : Int32, head_dim : Int32, capacity : Int32,
+                               scale : Float32) : Bool
+      false
+    end
+
+    def kv_fp8_kernels_available? : Bool
+      false
+    end
+
     def swiglu_forward(*args)
       raise "CUDA disabled"
     end
@@ -287,6 +307,11 @@ module SHAInet
 
     def gdn_gates(*args)
       raise "CUDA disabled"
+    end
+
+    def gdn_ab_proj(x : Pointer(Float32), wa : Pointer(Float32), wb : Pointer(Float32),
+                    ap : Pointer(Float32), bp : Pointer(Float32), d_model : Int32, heads : Int32) : Bool
+      false
     end
 
     def short_conv_silu3(d0 : Pointer(Float32), s0 : Pointer(Float32), st0 : Pointer(Float32), w0 : Pointer(Float32),

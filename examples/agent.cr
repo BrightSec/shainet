@@ -2029,6 +2029,10 @@ STDERR.puts "Loading model from #{model_dir}...".colorize(:dark_gray)
 # in speed rather than failing.
 agent_context = (ENV["SHAINET_AGENT_CONTEXT"]? || "65536").to_i
 ENV["SHAINET_MAX_CONTEXT"] ||= agent_context.to_s
+# fp8 KV cache by default: at 64K the cache is most of the VRAM reserve, and halving it versus fp16
+# frees about 2 GB for roughly eight more resident layers on a 16 GB card -- decode speed the agent
+# feels on every token. SHAINET_KV_DTYPE=f16 opts back out.
+ENV["SHAINET_KV_DTYPE"] ||= "fp8"
 # A 30B takes about nine minutes here. Without a progress line that is indistinguishable
 # from a hang, and the layer loop is where nearly all of it goes.
 load_started = Time.monotonic

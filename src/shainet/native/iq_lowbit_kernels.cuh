@@ -17,8 +17,8 @@
 //
 // Codebook placement follows what was measured on the IQ3 kernels: constant memory serializes
 // divergent per-lane lookups, so the grids that carry real traffic are staged into shared memory
-// once per block. The IQ1 grid is 16 KB, and IQ1 tensors are 19-38 MB of a ~10 GB model, so staging
-// it would cost more in occupancy than it could win -- those two read the constant copy directly.
+// once per block. The IQ1 grid is 16 KB: the persistent GEMV stages it too, while the row-dequant,
+// which launches a block per row slice and could not amortize it, reads the constant copy.
 // Q2_K needs no codebook at all; it is a plain 2-bit scale-and-offset.
 
 #ifndef SHAINET_IQ_LOWBIT_KERNELS_CUH
@@ -129,6 +129,7 @@ __device__ __forceinline__ void decode_iq2s_8(const unsigned char* __restrict__ 
 // reassembled from one nibble of each of the four scale words. Codebook values are SIGNED, and each
 // group carries a +/- delta rather than a sign mask.
 __device__ __forceinline__ void decode_iq1m_8(const unsigned char* __restrict__ block,
+                                              const uint64_t* __restrict__ grid,
                                               int ib32, int lpos, float* v) {
     const unsigned char* qs = block + 0;
     const unsigned char* qh = block + 32;
@@ -149,7 +150,7 @@ __device__ __forceinline__ void decode_iq1m_8(const unsigned char* __restrict__ 
     const int idx = q[lpos] | (((lpos & 1) ? (hb << 4) : (hb << 8)) & 0x700);
     const float delta = ((lpos & 1) ? (hb & 0x80) : (hb & 0x08)) ? -SHAINET_IQ1S_DELTA_F
                                                                  : SHAINET_IQ1S_DELTA_F;
-    const unsigned long long g = d_iq1s_grid[idx];
+    const unsigned long long g = grid[idx];
     #pragma unroll
     for (int t = 0; t < 8; ++t) {
         const float gv = (float)((signed char)((g >> (8 * t)) & 0xFFULL));
@@ -160,6 +161,7 @@ __device__ __forceinline__ void decode_iq1m_8(const unsigned char* __restrict__ 
 // IQ1_S: d, qs[32], qh[8 x uint16]. Scale, three high index bits per group and the delta sign all
 // live in one uint16 per 32-value sub-block.
 __device__ __forceinline__ void decode_iq1s_8(const unsigned char* __restrict__ block,
+                                              const uint64_t* __restrict__ grid,
                                               int ib32, int lpos, float* v) {
     const float d = __half2float(*((const __half*)(block + 0)));
     const unsigned char* qs = block + 2;
@@ -168,7 +170,7 @@ __device__ __forceinline__ void decode_iq1s_8(const unsigned char* __restrict__ 
     const float dl = d * (float)(2 * ((h >> 12) & 7) + 1);
     const float delta = (h & 0x8000) ? -SHAINET_IQ1S_DELTA_F : SHAINET_IQ1S_DELTA_F;
     const int idx = qs[4 * ib32 + lpos] | (((h >> (3 * lpos)) & 7) << 8);
-    const unsigned long long g = d_iq1s_grid[idx];
+    const unsigned long long g = grid[idx];
     #pragma unroll
     for (int t = 0; t < 8; ++t) {
         const float gv = (float)((signed char)((g >> (8 * t)) & 0xFFULL));
@@ -180,38 +182,48 @@ __device__ __forceinline__ void decode_iq1s_8(const unsigned char* __restrict__ 
 // Kernel generation. One GEMV and one row-dequant per type, from the decoder above.
 //
 // STAGE names the shared-memory preamble and DECODE the call, so a type that needs no codebook
-// (Q2_K) and one that needs an 8 KB grid (IQ2_S) instantiate from the same template.
+// (Q2_K) and one that needs an 8 KB grid (IQ2_S) instantiate from the same template. The GEMV and
+// the row-dequant take SEPARATE stage/decode arguments because their grids differ: the GEMV is
+// persistent (a few blocks per SM walking rows with a grid stride, as the IQ3 kernels do), so it can
+// afford to stage even IQ1's 16 KB codebook once per block, while the row-dequant launches a block
+// per (row, block-slice) and must not.
+//
+// The GEMV loop also loads its activations as two float4 and is unrolled so several blocks' loads
+// are in flight per lane -- the same two changes that took the IQ3 kernels from ~140 to ~350 GB/s.
 // ---------------------------------------------------------------------------------------------
 
-#define SHAINET_IQ_LOWBIT_KERNELS(NAME, BYTES, STAGE, DECODE)                                     \
+#define SHAINET_IQ_LOWBIT_KERNELS(NAME, BYTES, GSTAGE, GDECODE, STAGE, DECODE)                    \
 __global__ void gemv_##NAME##_kernel(const float* __restrict__ x,                                 \
                                      const unsigned char* __restrict__ w,                         \
                                      float* __restrict__ y,                                       \
                                      int M, int N, int K) {                                       \
-    STAGE                                                                                         \
-    const int warp = threadIdx.x >> 5;                                                            \
+    GSTAGE                                                                                        \
     const int lane = threadIdx.x & 31;                                                            \
-    const int n = blockIdx.x * (blockDim.x >> 5) + warp;                                           \
+    const int wpb = blockDim.x >> 5;                                                              \
     const int m = blockIdx.y;                                                                     \
-    if (n >= N || m >= M) return;                                                                 \
+    if (m >= M) return;                                                                           \
     const int nblocks = K / GGUF_QK_K;                                                            \
     const long row_bytes = (long)nblocks * (BYTES);                                               \
-    const unsigned char* wrow = w + (long)n * row_bytes;                                          \
     const float* xrow = x + (long)m * K;                                                          \
     const int ib32 = lane >> 2;                                                                   \
     const int lpos = lane & 3;                                                                    \
-    float acc = 0.0f;                                                                             \
-    for (int b = 0; b < nblocks; ++b) {                                                           \
-        const unsigned char* block = wrow + (long)b * (BYTES);                                    \
-        float v[8];                                                                               \
-        DECODE                                                                                    \
-        const float* xp = xrow + b * GGUF_QK_K + ib32 * 32 + lpos * 8;                            \
+    for (int n = blockIdx.x * wpb + (threadIdx.x >> 5); n < N; n += gridDim.x * wpb) {            \
+        const unsigned char* wrow = w + (long)n * row_bytes;                                      \
+        float acc = 0.0f;                                                                         \
+        _Pragma("unroll 4")                                                                        \
+        for (int b = 0; b < nblocks; ++b) {                                                       \
+            const unsigned char* block = wrow + (long)b * (BYTES);                                \
+            float v[8];                                                                           \
+            GDECODE                                                                               \
+            const float4* xp = (const float4*)(xrow + b * GGUF_QK_K + ib32 * 32 + lpos * 8);      \
+            const float4 xa = xp[0], xb = xp[1];                                                  \
+            acc += v[0] * xa.x + v[1] * xa.y + v[2] * xa.z + v[3] * xa.w                           \
+                 + v[4] * xb.x + v[5] * xb.y + v[6] * xb.z + v[7] * xb.w;                          \
+        }                                                                                         \
         _Pragma("unroll")                                                                          \
-        for (int t = 0; t < 8; ++t) acc += v[t] * xp[t];                                          \
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);             \
+        if (lane == 0) y[(long)m * N + n] = acc;                                                  \
     }                                                                                             \
-    _Pragma("unroll")                                                                              \
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xFFFFFFFF, acc, s);                 \
-    if (lane == 0) y[(long)m * N + n] = acc;                                                      \
 }                                                                                                 \
                                                                                                   \
 __global__ void dequant_##NAME##_rows_kernel(const unsigned char* __restrict__ w,                 \
@@ -263,11 +275,24 @@ __global__ void dequant_##NAME##_rows_kernel(const unsigned char* __restrict__ w
     if (threadIdx.x < 8) s_km[threadIdx.x] = (unsigned char)(1u << threadIdx.x);                  \
     __syncthreads();
 
-SHAINET_IQ_LOWBIT_KERNELS(q2k_lb, 84, STAGE_NONE, decode_q2k_8(block, ib32, lpos, v);)
-SHAINET_IQ_LOWBIT_KERNELS(iq2xxs, 66, STAGE_G256_SIGNS, decode_iq2xxs_8(block, s_g, s_ks, ib32, lpos, v);)
-SHAINET_IQ_LOWBIT_KERNELS(iq2xs, 74, STAGE_G512_SIGNS, decode_iq2xs_8(block, s_g, s_ks, ib32, lpos, v);)
-SHAINET_IQ_LOWBIT_KERNELS(iq2s, 82, STAGE_G1024_MASK, decode_iq2s_8(block, s_g, s_km, ib32, lpos, v);)
-SHAINET_IQ_LOWBIT_KERNELS(iq1m, 56, STAGE_NONE, decode_iq1m_8(block, ib32, lpos, v);)
-SHAINET_IQ_LOWBIT_KERNELS(iq1s, 50, STAGE_NONE, decode_iq1s_8(block, ib32, lpos, v);)
+// IQ1's 16 KB grid, for the persistent GEMV only (see the macro comment).
+#define STAGE_G2048_IQ1                                                                           \
+    __shared__ uint64_t s_g[2048];                                                                \
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) s_g[i] = d_iq1s_grid[i];                 \
+    __syncthreads();
+
+#define SHAINET_IQ_LOWBIT_SAME(NAME, BYTES, STAGE, DECODE) \
+    SHAINET_IQ_LOWBIT_KERNELS(NAME, BYTES, STAGE, DECODE, STAGE, DECODE)
+
+SHAINET_IQ_LOWBIT_SAME(q2k_lb, 84, STAGE_NONE, decode_q2k_8(block, ib32, lpos, v);)
+SHAINET_IQ_LOWBIT_SAME(iq2xxs, 66, STAGE_G256_SIGNS, decode_iq2xxs_8(block, s_g, s_ks, ib32, lpos, v);)
+SHAINET_IQ_LOWBIT_SAME(iq2xs, 74, STAGE_G512_SIGNS, decode_iq2xs_8(block, s_g, s_ks, ib32, lpos, v);)
+SHAINET_IQ_LOWBIT_SAME(iq2s, 82, STAGE_G1024_MASK, decode_iq2s_8(block, s_g, s_km, ib32, lpos, v);)
+SHAINET_IQ_LOWBIT_KERNELS(iq1m, 56,
+                          STAGE_G2048_IQ1, decode_iq1m_8(block, s_g, ib32, lpos, v);,
+                          STAGE_NONE, decode_iq1m_8(block, d_iq1s_grid, ib32, lpos, v);)
+SHAINET_IQ_LOWBIT_KERNELS(iq1s, 50,
+                          STAGE_G2048_IQ1, decode_iq1s_8(block, s_g, ib32, lpos, v);,
+                          STAGE_NONE, decode_iq1s_8(block, d_iq1s_grid, ib32, lpos, v);)
 
 #endif // SHAINET_IQ_LOWBIT_KERNELS_CUH

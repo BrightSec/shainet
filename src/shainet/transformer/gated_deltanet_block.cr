@@ -325,15 +325,21 @@ module SHAInet
 
       ap = resident_buf(:ap, seq, @num_v_heads)
       bp = resident_buf(:bp, seq, @num_v_heads)
-      h = GatedDeltaNetBlock.shared_cublas
-      # ap is row-major [seq, heads], i.e. column-major [heads, seq]; w_alpha is row-major
-      # [d_model, heads], i.e. column-major [heads, d_model]. So this is a plain N,N product
-      # W'(heads x d_model) * x'(d_model x seq) -- NO transpose. Using the transposed form here
-      # silently mixed the head and model axes and moved the <|im_start|> logit by 4%.
-      CUDA.gemm(h, wa.device_ptr.not_nil!, xd.device_ptr.not_nil!,
-        ap.device_ptr.not_nil!, @num_v_heads, seq, @d_model, @num_v_heads, @d_model, @num_v_heads)
-      CUDA.gemm(h, wb.device_ptr.not_nil!, xd.device_ptr.not_nil!,
-        bp.device_ptr.not_nil!, @num_v_heads, seq, @d_model, @num_v_heads, @d_model, @num_v_heads)
+      # One token: a dedicated kernel computes both projections in one pass. cuBLAS takes ~31 us
+      # per call at this shape, 96 calls a token across the stack.
+      ab_done = seq == 1 && CUDA.gdn_ab_proj(xd.device_ptr.not_nil!, wa.device_ptr.not_nil!,
+        wb.device_ptr.not_nil!, ap.device_ptr.not_nil!, bp.device_ptr.not_nil!, @d_model, @num_v_heads)
+      unless ab_done
+        h = GatedDeltaNetBlock.shared_cublas
+        # ap is row-major [seq, heads], i.e. column-major [heads, seq]; w_alpha is row-major
+        # [d_model, heads], i.e. column-major [heads, d_model]. So this is a plain N,N product
+        # W'(heads x d_model) * x'(d_model x seq) -- NO transpose. Using the transposed form here
+        # silently mixed the head and model axes and moved the <|im_start|> logit by 4%.
+        CUDA.gemm(h, wa.device_ptr.not_nil!, xd.device_ptr.not_nil!,
+          ap.device_ptr.not_nil!, @num_v_heads, seq, @d_model, @num_v_heads, @d_model, @num_v_heads)
+        CUDA.gemm(h, wb.device_ptr.not_nil!, xd.device_ptr.not_nil!,
+          bp.device_ptr.not_nil!, @num_v_heads, seq, @d_model, @num_v_heads, @d_model, @num_v_heads)
+      end
       ad = resident_buf(:ad, seq, @num_v_heads)
       bd = resident_buf(:bd, seq, @num_v_heads)
       CUDA.gdn_gates(ad.device_ptr.not_nil!, bd.device_ptr.not_nil!,
