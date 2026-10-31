@@ -159,6 +159,27 @@ module SHAInet
       false
     end
 
+    def gemm_tn_f16(*args) : Int32
+      raise "CUDA disabled"
+    end
+
+    def dequant_rows_f16(name : String, w : Pointer(UInt8), out_ptr : Pointer(UInt16),
+                         row0 : Int32, rows : Int32, k : Int32) : Bool
+      false
+    end
+
+    def f16_gemm_helpers_available? : Bool
+      false
+    end
+
+    def rows_to_f16_scaled(*args)
+      raise "CUDA disabled"
+    end
+
+    def scale_rows(*args)
+      raise "CUDA disabled"
+    end
+
     def attention_prefill(suffix : String, q : Pointer(Float32), kc : Pointer(Void), vc : Pointer(Void),
                           out_ptr : Pointer(Float32), new_tokens : Int32, start_pos : Int32,
                           num_heads : Int32, heads_per_kv : Int32, head_dim : Int32,

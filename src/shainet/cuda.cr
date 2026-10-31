@@ -42,6 +42,12 @@ module SHAInet
                          alpha : Pointer(Float32),
                          x : Pointer(Float32), incx : Int32,
                          y : Pointer(Float32), incy : Int32) : Int32
+      fun cublasGemmEx(handle : Handle, transa : Int32, transb : Int32,
+                       m : Int32, n : Int32, k : Int32,
+                       alpha : Void*, a : Void*, atype : Int32, lda : Int32,
+                       b : Void*, btype : Int32, ldb : Int32,
+                       beta : Void*, c : Void*, ctype : Int32, ldc : Int32,
+                       compute_type : Int32, algo : Int32) : Int32
     end
 
     enum MemcpyKind
@@ -306,6 +312,61 @@ module SHAInet
         pointerof(alpha), a, lda,
         b, ldb,
         pointerof(beta), c, ldc)
+    end
+
+    CUDA_R_16F         =  2
+    CUDA_R_32F         =  0
+    CUBLAS_COMPUTE_32F = 68
+    CUBLAS_GEMM_DEFAULT = -1
+
+    # gemm_tn with half A and B and an fp32 C, accumulated in fp32 on tensor cores. Same layout
+    # contract as gemm_tn. Returns the cuBLAS status (0 on success).
+    def gemm_tn_f16(handle : LibCUBLAS::Handle, a : Pointer(UInt16), b : Pointer(UInt16), c : Pointer(Float32),
+                    m : Int32, n : Int32, k : Int32, lda : Int32, ldb : Int32, ldc : Int32) : Int32
+      alpha = 1.0_f32
+      beta = 0.0_f32
+      LibCUBLAS.cublasGemmEx(handle,
+        Operation::T.value, Operation::N.value,
+        m, n, k,
+        pointerof(alpha).as(Void*), a.as(Void*), CUDA_R_16F, lda,
+        b.as(Void*), CUDA_R_16F, ldb,
+        pointerof(beta).as(Void*), c.as(Void*), CUDA_R_32F, ldc,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)
+    end
+
+    @@dequant_f16_procs = Hash(String, Proc(Pointer(UInt8), Pointer(UInt16), Int32, Int32, Int32, Nil)?).new
+    @@rows_to_f16_scaled_proc : Proc(Pointer(Float32), Pointer(UInt16), Pointer(Float32), Int32, Int32, Void)?
+    @@scale_rows_proc : Proc(Pointer(Float32), Pointer(Float32), Int32, Int32, Void)?
+
+    # Row-dequant into a half buffer (dequant_<name>_rows_f16). False when the kernel is missing.
+    def dequant_rows_f16(name : String, w : Pointer(UInt8), out_ptr : Pointer(UInt16),
+                         row0 : Int32, rows : Int32, k : Int32) : Bool
+      sym = "dequant_#{name}_rows_f16"
+      unless @@dequant_f16_procs.has_key?(sym)
+        @@dequant_f16_procs[sym] = load_kernel_proc(sym, Proc(Pointer(UInt8), Pointer(UInt16), Int32, Int32, Int32, Nil))
+      end
+      fn = @@dequant_f16_procs[sym]
+      return false unless fn
+      fn.call(w, out_ptr, row0, rows, k)
+      true
+    end
+
+    # Whether the fp16 prefill GEMM's helper kernels are present.
+    def f16_gemm_helpers_available? : Bool
+      @@rows_to_f16_scaled_proc ||= load_kernel_proc("rows_to_f16_scaled",
+        Proc(Pointer(Float32), Pointer(UInt16), Pointer(Float32), Int32, Int32, Void))
+      @@scale_rows_proc ||= load_kernel_proc("scale_rows", Proc(Pointer(Float32), Pointer(Float32), Int32, Int32, Void))
+      !@@rows_to_f16_scaled_proc.nil? && !@@scale_rows_proc.nil?
+    end
+
+    # Activations [m, k] to half with a power-of-two scale per row; inv_scale[r] undoes it.
+    def rows_to_f16_scaled(x : Pointer(Float32), xh : Pointer(UInt16), inv_scale : Pointer(Float32), m : Int32, k : Int32)
+      @@rows_to_f16_scaled_proc.not_nil!.call(x, xh, inv_scale, m, k)
+    end
+
+    # y[r, :] *= s[r] for a row-major [m, n].
+    def scale_rows(y : Pointer(Float32), s : Pointer(Float32), m : Int32, n : Int32)
+      @@scale_rows_proc.not_nil!.call(y, s, m, n)
     end
 
     def gemm_accumulate(handle : LibCUBLAS::Handle, a : Pointer(Float32), b : Pointer(Float32), c : Pointer(Float32),

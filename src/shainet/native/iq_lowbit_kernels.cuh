@@ -225,8 +225,10 @@ __global__ void gemv_##NAME##_kernel(const float* __restrict__ x,               
     }                                                                                             \
 }                                                                                                 \
                                                                                                   \
+extern "C++" {                                                                                    \
+template <typename OUT>                                                                           \
 __global__ void dequant_##NAME##_rows_kernel(const unsigned char* __restrict__ w,                 \
-                                             float* __restrict__ out,                             \
+                                             OUT* __restrict__ out,                               \
                                              int row0, int rows, int K) {                         \
     STAGE                                                                                         \
     const int lane = threadIdx.x & 31;                                                            \
@@ -243,11 +245,10 @@ __global__ void dequant_##NAME##_rows_kernel(const unsigned char* __restrict__ w
         const unsigned char* block = w + (long)(row0 + r) * row_bytes + (long)b * (BYTES);        \
         float v[8];                                                                               \
         DECODE                                                                                    \
-        float4* op = (float4*)(out + (long)r * K + b * GGUF_QK_K + ib32 * 32 + lpos * 8);         \
-        op[0] = make_float4(v[0], v[1], v[2], v[3]);                                              \
-        op[1] = make_float4(v[4], v[5], v[6], v[7]);                                              \
+        dq_store8(out + (long)r * K + b * GGUF_QK_K + ib32 * 32 + lpos * 8, v);                  \
     }                                                                                             \
-}
+}                                                                                                 \
+} /* extern "C++" */
 
 // Shared-memory staging preambles. __syncthreads() is safe in both templates: every thread of the
 // block reaches it before any early return that depends on the row index.

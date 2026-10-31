@@ -278,6 +278,8 @@ module SHAInet
     # transposed operand and ldc set to the FULL N, each chunk writes straight into its own
     # columns of the finished result.
     def gemm_into(x : CudaMatrix, result : CudaMatrix) : CudaMatrix
+      return result if gemm_into_f16(x, result)
+
       k = @rows
       chunk = SCRATCH_ROWS > @cols ? @cols : SCRATCH_ROWS
       buf = GGUFMatrix.scratch(chunk * k)
@@ -331,6 +333,97 @@ module SHAInet
         CUDA.free(@dev_ptr.as(Pointer(Void)))
         @dev_ptr = Pointer(UInt8).null
       end
+    end
+
+    # ── fp16 tensor-core prefill GEMM ──
+    #
+    # The TF32 path above was ~45% of a prefill: cuBLAS SGEMM at ~25 TFLOP/s on 256-token chunks,
+    # fed by an fp32 dequant of every weight. Here the weight slice is dequantized straight to half
+    # and the activations are converted to half once per call, and cublasGemmEx runs fp16 x fp16 with
+    # fp32 accumulation -- twice TF32's tensor rate on Ada, from half the scratch bytes.
+    #
+    # Precision is TF32's: both keep a 10-bit mantissa. The difference is fp16's 5-bit exponent, which
+    # the activations sidestep with a per-row power-of-two scale (exact, undone on the output by
+    # scale_rows). The dequantized weights are products of an fp16 block scale and small integers, so
+    # they are in range by construction.
+    #
+    # SHAINET_FP16_PREFILL_GEMM=0 keeps the TF32 path.
+    @@f16_gemm : Bool? = nil
+    @@scratch_h : Pointer(UInt16) = Pointer(UInt16).null
+    @@scratch_h_elems : Int64 = 0_i64
+    @@xh : Pointer(UInt16) = Pointer(UInt16).null
+    @@xh_elems : Int64 = 0_i64
+    @@inv_scale : Pointer(Float32) = Pointer(Float32).null
+    @@inv_scale_elems : Int32 = 0
+
+    F16_DEQUANT_NAMES = {
+      GGUF::GGMLType::IQ4_XS  => "iq4xs",
+      GGUF::GGMLType::IQ3_S   => "iq3s",
+      GGUF::GGMLType::IQ3_XXS => "iq3xxs",
+      GGUF::GGMLType::Q2_K    => "q2k_lb",
+      GGUF::GGMLType::IQ2_XXS => "iq2xxs",
+      GGUF::GGMLType::IQ2_XS  => "iq2xs",
+      GGUF::GGMLType::IQ2_S   => "iq2s",
+      GGUF::GGMLType::IQ1_M   => "iq1m",
+      GGUF::GGMLType::IQ1_S   => "iq1s",
+      GGUF::GGMLType::Q4_K    => "q4k",
+      GGUF::GGMLType::Q5_K    => "q5k",
+      GGUF::GGMLType::Q6_K    => "q6k",
+    }
+
+    def self.f16_gemm? : Bool
+      flag = @@f16_gemm
+      return flag unless flag.nil?
+      flag = ENV.fetch("SHAINET_FP16_PREFILL_GEMM", "1") != "0" && CUDA.fully_available? &&
+             CUDA.f16_gemm_helpers_available?
+      @@f16_gemm = flag
+      flag
+    end
+
+    # Grow-only device buffer of `elems` elements of `T`.
+    def self.grow(ptr : Pointer(T), have : Int64, want : Int64) : {Pointer(T), Int64} forall T
+      return {ptr, have} if have >= want
+      CUDA.free(ptr.as(Pointer(Void))) unless ptr.null?
+      p = Pointer(Void).null
+      CUDA.malloc(pointerof(p), (want * sizeof(T)).to_u64)
+      {p.as(Pointer(T)), want}
+    end
+
+    # Returns false when this weight or device cannot take the fp16 path, leaving gemm_into's TF32
+    # path to run.
+    private def gemm_into_f16(x : CudaMatrix, result : CudaMatrix) : Bool
+      return false unless GGUFMatrix.f16_gemm?
+      name = F16_DEQUANT_NAMES[@ggml_type]?
+      return false unless name
+
+      k = @rows
+      m = x.rows
+      chunk = SCRATCH_ROWS > @cols ? @cols : SCRATCH_ROWS
+      @@scratch_h, @@scratch_h_elems = GGUFMatrix.grow(@@scratch_h, @@scratch_h_elems, chunk.to_i64 * k)
+      @@xh, @@xh_elems = GGUFMatrix.grow(@@xh, @@xh_elems, m.to_i64 * k)
+      ip, ie = GGUFMatrix.grow(@@inv_scale, @@inv_scale_elems.to_i64, m.to_i64)
+      @@inv_scale, @@inv_scale_elems = ip, ie.to_i32
+      return false if @@scratch_h.null? || @@xh.null? || @@inv_scale.null?
+
+      CUDA.rows_to_f16_scaled(x.device_ptr.not_nil!, @@xh, @@inv_scale, m, k)
+      rp = result.device_ptr.not_nil!
+      handle = CUDA.create_handle(tf32: true)
+      begin
+        row0 = 0
+        while row0 < @cols
+          rows = @cols - row0
+          rows = chunk if rows > chunk
+          return false unless CUDA.dequant_rows_f16(name, @dev_ptr, @@scratch_h, row0, rows, k)
+          status = CUDA.gemm_tn_f16(handle, @@scratch_h, @@xh, rp + row0, rows, m, k, k, k, @cols)
+          raise "cublasGemmEx failed (status #{status})" unless status == 0
+          row0 += rows
+        end
+      ensure
+        CUDA.destroy_handle(handle)
+      end
+      CUDA.scale_rows(rp, @@inv_scale, m, @cols)
+      result.mark_device_dirty!
+      true
     end
 
     # Device memory footprint in bytes.
