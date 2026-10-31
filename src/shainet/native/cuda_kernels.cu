@@ -2329,11 +2329,255 @@ static int attention_prefill_wmma_launch(const float* q, const KV* kc, const KV*
     default: return 0;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// FlashAttention-2-style prefill attention on mma.sync (fp16 inputs, fp32 accumulation).
+//
+// The WMMA kernel above runs TWO passes over the keys because WMMA's accumulator layout is opaque and
+// an online softmax cannot rescale its output rows. mma.sync m16n8k16 has a documented layout -- a
+// thread holds rows g and g+8 of every accumulator tile -- so here the running max and sum are kept
+// per row, the output accumulators are rescaled in registers, and P goes straight from the score
+// accumulators into the A operand of the P*V product. One pass: Q*K^T once instead of twice.
+//
+// Block: 64 queries of one head (4 warps x 16 rows); keys in tiles of 32. Q, K and V are staged as
+// half with rows padded by 8 so ldmatrix hits distinct banks; Q and K feed ldmatrix, V feeds
+// ldmatrix.trans (P*V needs V as a column-major operand). fp8 and fp16 caches convert to half exactly.
+#define FA2_BQ 64
+#define FA2_BK 32
+
+__device__ __forceinline__ void fa2_ldsm_x4(unsigned int* r, const __half* p) {
+    const unsigned int a = (unsigned int)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void fa2_ldsm_x4_t(unsigned int* r, const __half* p) {
+    const unsigned int a = (unsigned int)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void fa2_mma(float* c, const unsigned int* a, unsigned int b0, unsigned int b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+__device__ __forceinline__ unsigned int fa2_pack(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);
+    return *((unsigned int*)&h);
+}
+
+template <typename KV, int D>
+__global__ void __launch_bounds__(128) attention_prefill_fa2_kernel(
+    const float* __restrict__ q, const KV* __restrict__ kc, const KV* __restrict__ vc,
+    float* __restrict__ out, int new_tokens, int start_pos, int num_heads, int heads_per_kv,
+    int capacity, float scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    extern __shared__ __align__(128) unsigned char fa2_raw[];
+    constexpr int LD = D + 8;
+    constexpr int NT_O = D / 8;                 // output n8 tiles per warp row block
+    __half* Qs = (__half*)fa2_raw;              // [BQ][LD]
+    __half* Ks = Qs + FA2_BQ * LD;              // [BK][LD]
+    __half* Vs = Ks + FA2_BK * LD;              // [BK][LD]
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int q0 = blockIdx.x * FA2_BQ, h = blockIdx.y;
+    const int kv_h = h / heads_per_kv;
+    const int d_model = num_heads * D;
+    const int rows = min(FA2_BQ, new_tokens - q0);
+    const int kend = start_pos + q0 + rows;
+    const KV* kh = kc + (long)kv_h * capacity * D;
+    const KV* vh = vc + (long)kv_h * capacity * D;
+
+    for (int idx = tid; idx < FA2_BQ * D; idx += 128) {
+        const int qi = idx / D, d = idx - qi * D;
+        const float v = (qi < rows) ? q[(long)(q0 + qi) * d_model + (long)h * D + d] : 0.0f;
+        Qs[qi * LD + d] = __float2half(v);
+    }
+
+    const int r0 = warp * 16 + g;               // this thread's rows within the block: r0, r0 + 8
+    const int pos0 = start_pos + q0 + r0, pos1 = pos0 + 8;
+    const bool ok0 = r0 < rows, ok1 = r0 + 8 < rows;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    float o[NT_O][4];
+    #pragma unroll
+    for (int i = 0; i < NT_O; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+
+    for (int j0 = 0; j0 < kend; j0 += FA2_BK) {
+        __syncthreads();
+        constexpr int V8 = D / 8;
+        for (int idx = tid; idx < FA2_BK * V8; idx += 128) {
+            const int kj = idx / V8, d = (idx - kj * V8) * 8;
+            const int j = j0 + kj;
+            uint4* kd = (uint4*)(Ks + kj * LD + d);
+            uint4* vd = (uint4*)(Vs + kj * LD + d);
+            if (j < kend) {
+                *kd = kv_to_half8(kh + (long)j * D + d);
+                *vd = kv_to_half8(vh + (long)j * D + d);
+            } else {
+                *kd = make_uint4(0, 0, 0, 0);
+                *vd = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        // S = Q_w K^T: 16 x 32 per warp, four n8 tiles.
+        float sacc[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) sacc[i][0] = sacc[i][1] = sacc[i][2] = sacc[i][3] = 0.0f;
+        #pragma unroll
+        for (int kk = 0; kk < D / 16; ++kk) {
+            unsigned int a[4];
+            fa2_ldsm_x4(a, Qs + (warp * 16 + (lane & 15)) * LD + kk * 16 + (lane >> 4) * 8);
+            #pragma unroll
+            for (int np = 0; np < 2; ++np) {      // key tiles (2np, 2np+1)
+                unsigned int b[4];
+                fa2_ldsm_x4(b, Ks + (np * 16 + (lane & 7) + ((lane >> 4) << 3)) * LD + kk * 16 + ((lane >> 3) & 1) * 8);
+                fa2_mma(sacc[2 * np], a, b[0], b[1]);
+                fa2_mma(sacc[2 * np + 1], a, b[2], b[3]);
+            }
+        }
+
+        // Online softmax on rows r0 (c0, c1) and r0 + 8 (c2, c3).
+        float mx0 = -INFINITY, mx1 = -INFINITY;
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int j = j0 + nt * 8 + 2 * t + e;
+                const bool v0 = ok0 && j <= pos0 && j < kend, v1 = ok1 && j <= pos1 && j < kend;
+                sacc[nt][e] = v0 ? sacc[nt][e] * scale : -INFINITY;
+                sacc[nt][2 + e] = v1 ? sacc[nt][2 + e] * scale : -INFINITY;
+                mx0 = fmaxf(mx0, sacc[nt][e]);
+                mx1 = fmaxf(mx1, sacc[nt][2 + e]);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFF, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFF, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFF, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFF, mx1, 2));
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = (mn0 == -INFINITY || m0 == -INFINITY) ? (mn0 == -INFINITY ? 1.0f : 0.0f) : expf(m0 - mn0);
+        const float al1 = (mn1 == -INFINITY || m1 == -INFINITY) ? (mn1 == -INFINITY ? 1.0f : 0.0f) : expf(m1 - mn1);
+        m0 = mn0;
+        m1 = mn1;
+        float ps0 = 0.0f, ps1 = 0.0f;
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const float p0 = (sacc[nt][e] == -INFINITY) ? 0.0f : expf(sacc[nt][e] - mn0);
+                const float p1 = (sacc[nt][2 + e] == -INFINITY) ? 0.0f : expf(sacc[nt][2 + e] - mn1);
+                sacc[nt][e] = p0;
+                sacc[nt][2 + e] = p1;
+                ps0 += p0;
+                ps1 += p1;
+            }
+        }
+        l0 = l0 * al0 + ps0;
+        l1 = l1 * al1 + ps1;
+        #pragma unroll
+        for (int i = 0; i < NT_O; ++i) {
+            o[i][0] *= al0; o[i][1] *= al0;
+            o[i][2] *= al1; o[i][3] *= al1;
+        }
+
+        // O += P (16 x 32) * V (32 x D). P's accumulator tiles pair into the A operand directly.
+        #pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            unsigned int pa[4];
+            pa[0] = fa2_pack(sacc[2 * ks][0], sacc[2 * ks][1]);
+            pa[1] = fa2_pack(sacc[2 * ks][2], sacc[2 * ks][3]);
+            pa[2] = fa2_pack(sacc[2 * ks + 1][0], sacc[2 * ks + 1][1]);
+            pa[3] = fa2_pack(sacc[2 * ks + 1][2], sacc[2 * ks + 1][3]);
+            #pragma unroll
+            for (int np = 0; np < NT_O / 2; ++np) {   // dim tiles (2np, 2np+1)
+                unsigned int b[4];
+                fa2_ldsm_x4_t(b, Vs + (ks * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LD + np * 16 + (lane >> 4) * 8);
+                fa2_mma(o[2 * np], pa, b[0], b[1]);
+                fa2_mma(o[2 * np + 1], pa, b[2], b[3]);
+            }
+        }
+    }
+
+    l0 += __shfl_xor_sync(0xFFFFFFFF, l0, 1);
+    l0 += __shfl_xor_sync(0xFFFFFFFF, l0, 2);
+    l1 += __shfl_xor_sync(0xFFFFFFFF, l1, 1);
+    l1 += __shfl_xor_sync(0xFFFFFFFF, l1, 2);
+    const float inv0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, inv1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < NT_O; ++i) {
+        const int d = i * 8 + 2 * t;
+        if (ok0) {
+            float* orow = out + (long)(q0 + r0) * d_model + (long)h * D + d;
+            orow[0] = o[i][0] * inv0;
+            orow[1] = o[i][1] * inv0;
+        }
+        if (ok1) {
+            float* orow = out + (long)(q0 + r0 + 8) * d_model + (long)h * D + d;
+            orow[0] = o[i][2] * inv1;
+            orow[1] = o[i][3] * inv1;
+        }
+    }
+#endif
+}
+
+template <typename KV, int D>
+static int attention_prefill_fa2_launch_d(const float* q, const KV* kc, const KV* vc, float* out,
+                                          int new_tokens, int start_pos, int num_heads,
+                                          int heads_per_kv, int capacity, float scale) {
+    const size_t smem = (size_t)(FA2_BQ + 2 * FA2_BK) * (D + 8) * sizeof(__half);
+    static int state = 0;
+    if (state == 0) {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        state = (major >= 8 &&
+                 cudaFuncSetAttribute(attention_prefill_fa2_kernel<KV, D>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) == cudaSuccess) ? 1 : -1;
+        cudaGetLastError();
+    }
+    if (state < 0) return 0;
+    dim3 grid((new_tokens + FA2_BQ - 1) / FA2_BQ, num_heads);
+    attention_prefill_fa2_kernel<KV, D><<<grid, 128, smem>>>(q, kc, vc, out, new_tokens, start_pos,
+                                                             num_heads, heads_per_kv, capacity, scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in attention_prefill_fa2: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+
+// 1 when the FA2 kernel ran (sm_80+, head_dim 128/256, half or fp8 cache); 0 falls back.
+template <typename KV>
+static int attention_prefill_fa2_launch(const float* q, const KV* kc, const KV* vc, float* out,
+                                        int new_tokens, int start_pos, int num_heads,
+                                        int heads_per_kv, int head_dim, int capacity, float scale) {
+    static const bool enabled = [] {
+        const char* e = getenv("SHAINET_FA2_PREFILL_ATTN");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || new_tokens <= 0) return 0;
+    switch (head_dim) {
+    case 128: return attention_prefill_fa2_launch_d<KV, 128>(q, kc, vc, out, new_tokens, start_pos,
+                                                             num_heads, heads_per_kv, capacity, scale);
+    case 256: return attention_prefill_fa2_launch_d<KV, 256>(q, kc, vc, out, new_tokens, start_pos,
+                                                             num_heads, heads_per_kv, capacity, scale);
+    default: return 0;
+    }
+}
 } // extern "C++"
 
 int attention_prefill_f16(const float* q, const unsigned short* kc, const unsigned short* vc,
                           float* out, int new_tokens, int start_pos, int num_heads,
                           int heads_per_kv, int head_dim, int capacity, float scale) {
+    if (attention_prefill_fa2_launch<__half>(q, reinterpret_cast<const __half*>(kc),
+                                             reinterpret_cast<const __half*>(vc), out, new_tokens,
+                                             start_pos, num_heads, heads_per_kv, head_dim,
+                                             capacity, scale)) return 1;
     if (attention_prefill_wmma_launch<__half>(q, reinterpret_cast<const __half*>(kc),
                                               reinterpret_cast<const __half*>(vc), out, new_tokens,
                                               start_pos, num_heads, heads_per_kv, head_dim,
@@ -2347,6 +2591,10 @@ int attention_prefill_f16(const float* q, const unsigned short* kc, const unsign
 int attention_prefill_fp8(const float* q, const unsigned char* kc, const unsigned char* vc,
                           float* out, int new_tokens, int start_pos, int num_heads,
                           int heads_per_kv, int head_dim, int capacity, float scale) {
+    if (attention_prefill_fa2_launch<__nv_fp8_e4m3>(q, reinterpret_cast<const __nv_fp8_e4m3*>(kc),
+                                                    reinterpret_cast<const __nv_fp8_e4m3*>(vc), out,
+                                                    new_tokens, start_pos, num_heads, heads_per_kv,
+                                                    head_dim, capacity, scale)) return 1;
     if (attention_prefill_wmma_launch<__nv_fp8_e4m3>(q, reinterpret_cast<const __nv_fp8_e4m3*>(kc),
                                                      reinterpret_cast<const __nv_fp8_e4m3*>(vc), out,
                                                      new_tokens, start_pos, num_heads, heads_per_kv,
