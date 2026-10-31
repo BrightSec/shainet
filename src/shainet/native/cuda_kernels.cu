@@ -3122,6 +3122,257 @@ __global__ void gated_delta_rule_cols_kernel(
         if (r < rpg) state[sbase + (size_t)(g * rpg + r) * dv + c] = S[r];
 }
 
+// Chunked gated delta rule for prefill (WY form), fp32 on CUDA cores.
+//
+// The column kernel above walks the recurrence one token at a time: a barrier, the q/k loads and a
+// few shuffles per token, so it is latency-bound at ~2.5 ms per 1024 tokens per layer. Here a chunk
+// of C = 16 tokens is folded at once. With G the running log-decay inside the chunk,
+//   A = strict_tril(beta_r K_r.K_c e^(G_r - G_c)),  P = tril(Q_r.K_c e^(G_r - G_c)),
+//   solved = (I + A)^-1 (beta (V - e^G K S)),
+//   out = e^G Q S + P solved,   S <- e^G_last S + K^T (solved e^(G_last - G)),
+// which is the token recurrence exactly; only summation order differs (outputs agree to ~1e-5).
+// Per chunk that is two [32 x 128] x [128 x 32] products over [K; Q], a 16 x 16 forward
+// substitution and a rank-16 state update, with four barriers instead of sixteen. ~25% faster than
+// the column kernel at prefill lengths; it is still latency- rather than throughput-bound, and the
+// 192 blocks of a 48-head layer take two waves at two blocks per SM.
+//
+// Same arguments and layouts as gated_delta_rule; dk must be 128 and dv a multiple of 32.
+#define GDRC_C 16
+#define GDRC_LDX 36        // Xt row stride: 32 values + 4 pad (16-byte aligned, spreads update reads)
+
+extern "C++" {
+template <int V>
+__global__ void __launch_bounds__(256, 2) gated_delta_rule_chunk_kernel(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ alpha, const float* __restrict__ beta,
+    float* __restrict__ state, float* __restrict__ out,
+    int seq, int nv, int nk, int heads_per_k, float q_scale, int k_head_tiled) {
+    static_assert(V == 32, "thread mappings assume 32 value columns");
+    constexpr int C = GDRC_C, DK = 128, DV = 128, LDX = GDRC_LDX;
+    // Xt[i][r]: column i of the chunk's normalized keys (r < 16) and scaled queries (r >= 16).
+    __shared__ __align__(16) float Xt[DK * LDX];
+    __shared__ __align__(16) float S[DK * V];           // state slice [i][c]
+    __shared__ __align__(16) float KS[C * V], QS[C * V];
+    __shared__ __align__(16) float Sol[C * V], U[C * V];
+    __shared__ __align__(16) float A[C * C];
+    __shared__ float P[C * C];
+    __shared__ float G[C], Bt[C];
+    __shared__ __align__(16) float Vs[C * V];
+
+    const int h = blockIdx.x, c0 = blockIdx.y * V;
+    const int kh = k_head_tiled ? (h % nk) : (h / heads_per_k);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const size_t sbase = (size_t)h * DK * DV;
+    const size_t kstride = (size_t)nk * DK, vstride = (size_t)nv * DV;
+
+    for (int idx = tid; idx < DK * V; idx += 256) {
+        const int i = idx / V, c = idx - i * V;
+        S[idx] = state[sbase + (size_t)i * DV + c0 + c];
+    }
+
+    // Next chunk's inputs, loaded a whole chunk ahead so their latency hides behind the math.
+    float4 pq[2], pk[2];
+    float pv[2], pa = 1.0f, pb = 0.0f;
+    auto prefetch = [&](int t0) {
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int tt = t0 + warp + 8 * r;
+            pq[r] = pk[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tt < seq) {
+                pq[r] = *((const float4*)(q + (size_t)tt * kstride + (size_t)kh * DK) + lane);
+                pk[r] = *((const float4*)(k + (size_t)tt * kstride + (size_t)kh * DK) + lane);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int idx = tid + 256 * r, t = idx / V, tt = t0 + t;
+            pv[r] = tt < seq ? v[(size_t)tt * vstride + (size_t)h * DV + c0 + (idx - t * V)] : 0.0f;
+        }
+        if (warp == 0) {
+            const int tt = t0 + lane;
+            const bool ok = lane < C && tt < seq;
+            pa = ok ? alpha[(size_t)tt * nv + h] : 1.0f;
+            pb = ok ? beta[(size_t)tt * nv + h] : 0.0f;
+        }
+    };
+    prefetch(0);
+    for (int t0 = 0; t0 < seq; t0 += C) {
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) Vs[tid + 256 * r] = pv[r];
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const int t = warp + 8 * r;
+            const float4 qv = pq[r], kv = pk[r];
+            float sq = qv.x * qv.x + qv.y * qv.y + qv.z * qv.z + qv.w * qv.w;
+            float sk = kv.x * kv.x + kv.y * kv.y + kv.z * kv.z + kv.w * kv.w;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                sq += __shfl_xor_sync(0xFFFFFFFF, sq, o);
+                sk += __shfl_xor_sync(0xFFFFFFFF, sk, o);
+            }
+            const float nq = rsqrtf(fmaxf(sq, 1e-12f)) * q_scale, nkk = rsqrtf(fmaxf(sk, 1e-12f));
+            float* xd = Xt + (4 * lane) * LDX;
+            xd[t] = kv.x * nkk;           xd[C + t] = qv.x * nq;
+            xd[LDX + t] = kv.y * nkk;     xd[LDX + C + t] = qv.y * nq;
+            xd[2 * LDX + t] = kv.z * nkk; xd[2 * LDX + C + t] = qv.z * nq;
+            xd[3 * LDX + t] = kv.w * nkk; xd[3 * LDX + C + t] = qv.w * nq;
+        }
+        if (warp == 0) {
+            float g = __logf(fmaxf(pa, 1e-30f));
+            #pragma unroll
+            for (int o = 1; o < C; o <<= 1) {
+                const float p = __shfl_up_sync(0xFFFFFFFF, g, o);
+                if (lane >= o) g += p;
+            }
+            if (lane < C) {
+                G[lane] = g;
+                Bt[lane] = pb;
+            }
+        }
+        __syncthreads();
+        if (t0 + C < seq) prefetch(t0 + C);
+
+        // Phase 1. Warps 0-3: [K; Q] S, 4 rows x 2 columns per thread. Warps 4-5: [K; Q] K^T
+        // (the Gram matrices), 4 rows x 2 keys per thread. One LDS.128 + one LDS.64 per 8 FMAs.
+        if (warp < 4) {
+            const int rq = (tid & 7) * 4, c = ((tid >> 3) & 15) * 2;
+            float acc[4][2] = {};
+            #pragma unroll 4
+            for (int i = 0; i < DK; ++i) {
+                const float4 x = *((const float4*)(Xt + i * LDX + rq));
+                const float2 s = *((const float2*)(S + i * V + c));
+                acc[0][0] += x.x * s.x; acc[0][1] += x.x * s.y;
+                acc[1][0] += x.y * s.x; acc[1][1] += x.y * s.y;
+                acc[2][0] += x.z * s.x; acc[2][1] += x.z * s.y;
+                acc[3][0] += x.w * s.x; acc[3][1] += x.w * s.y;
+            }
+            float* dst = rq < C ? KS + rq * V : QS + (rq - C) * V;
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) *((float2*)(dst + r * V + c)) = make_float2(acc[r][0], acc[r][1]);
+        } else if (warp < 6) {
+            const int l = tid - 128;
+            const int rq = (l & 7) * 4, kc = ((l >> 3) & 7) * 2;
+            float acc[4][2] = {};
+            #pragma unroll 4
+            for (int i = 0; i < DK; ++i) {
+                const float4 x = *((const float4*)(Xt + i * LDX + rq));
+                const float2 s = *((const float2*)(Xt + i * LDX + kc));
+                acc[0][0] += x.x * s.x; acc[0][1] += x.x * s.y;
+                acc[1][0] += x.y * s.x; acc[1][1] += x.y * s.y;
+                acc[2][0] += x.z * s.x; acc[2][1] += x.z * s.y;
+                acc[3][0] += x.w * s.x; acc[3][1] += x.w * s.y;
+            }
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int row = rq + r, rr = row & (C - 1);
+                #pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int cc = kc + e;
+                    const float d = cc <= rr ? __expf(G[rr] - G[cc]) : 0.0f;
+                    if (row < C) A[cc * C + rr] = cc < rr ? acc[r][e] * d * Bt[rr] : 0.0f;   // transposed
+                    else P[rr * C + cc] = acc[r][e] * d;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Phase 2: solved = (I + A)^-1 delta by forward substitution, one value column per lane,
+        // with delta = beta * (v - e^G K S). U is solved scaled to the chunk end.
+        if (warp == 0) {
+            // Right-looking: once sol[j] is final, fold it into every later row at once. The 15 - j
+            // updates of a step are independent, so the dependent chain is 16 FMAs, not 120.
+            const int c = lane;
+            float d[C];
+            #pragma unroll
+            for (int i = 0; i < C; ++i) d[i] = Bt[i] * (Vs[i * V + c] - __expf(G[i]) * KS[i * V + c]);
+            #pragma unroll
+            for (int j = 0; j < C - 1; ++j) {
+                float a[C];
+                #pragma unroll
+                for (int m = 0; m < C / 4; ++m) {
+                    const float4 x = *((const float4*)(A + j * C) + m);
+                    a[4 * m] = x.x; a[4 * m + 1] = x.y; a[4 * m + 2] = x.z; a[4 * m + 3] = x.w;
+                }
+                #pragma unroll
+                for (int i = j + 1; i < C; ++i) d[i] -= a[i] * d[j];
+            }
+            const float gl = G[C - 1];
+            #pragma unroll
+            for (int i = 0; i < C; ++i) {
+                Sol[i * V + c] = d[i];
+                U[i * V + c] = d[i] * __expf(gl - G[i]);
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: out = e^G Q S + P solved; S = e^G_last S + K^T U (4 rows x 4 columns per thread).
+        for (int idx = tid; idx < C * V; idx += 256) {
+            const int t = idx / V, c = idx - t * V, tt = t0 + t;
+            float o = __expf(G[t]) * QS[idx];
+            #pragma unroll
+            for (int j = 0; j < C; ++j)
+                if (j <= t) o += P[t * C + j] * Sol[j * V + c];
+            if (tt < seq) out[(size_t)tt * vstride + (size_t)h * DV + c0 + c] = o;
+        }
+        {
+            const int i0 = (tid & 31) * 4, cc = (tid >> 5) * 4;
+            const float dl = __expf(G[C - 1]);
+            float kx[4][C];
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+                #pragma unroll
+                for (int m = 0; m < C / 4; ++m) {
+                    const float4 x = *((const float4*)(Xt + (i0 + r) * LDX + 4 * m));
+                    kx[r][4 * m] = x.x; kx[r][4 * m + 1] = x.y; kx[r][4 * m + 2] = x.z; kx[r][4 * m + 3] = x.w;
+                }
+            float4 s[4];
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                s[r] = *((float4*)(S + (i0 + r) * V + cc));
+                s[r].x *= dl; s[r].y *= dl; s[r].z *= dl; s[r].w *= dl;
+            }
+            #pragma unroll
+            for (int t = 0; t < C; ++t) {
+                const float4 u = *((const float4*)(U + t * V + cc));
+                #pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    s[r].x += kx[r][t] * u.x; s[r].y += kx[r][t] * u.y;
+                    s[r].z += kx[r][t] * u.z; s[r].w += kx[r][t] * u.w;
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) *((float4*)(S + (i0 + r) * V + cc)) = s[r];
+        }
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < DK * V; idx += 256) {
+        const int i = idx / V, c = idx - i * V;
+        state[sbase + (size_t)i * DV + c0 + c] = S[idx];
+    }
+}
+} // extern "C++"
+
+static int gated_delta_rule_chunked(const float* q, const float* k, const float* v,
+                                    const float* alpha, const float* beta, float* state, float* out,
+                                    int seq, int nv, int nk, int dk, int dv, int heads_per_k,
+                                    float q_scale, int k_head_tiled) {
+    static const bool enabled = [] {
+        const char* e = getenv("SHAINET_GDR_CHUNK");
+        return !(e && e[0] == '0');
+    }();
+    if (!enabled || seq < GDRC_C || dk != 128 || dv % 32 != 0) return 0;
+    if ((((uintptr_t)q | (uintptr_t)k) & 15) != 0) return 0;
+    gated_delta_rule_chunk_kernel<32><<<dim3(nv, dv / 32), 256>>>(q, k, v, alpha, beta, state, out, seq, nv,
+                                                                 nk, heads_per_k, q_scale, k_head_tiled);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in gated_delta_rule_chunked: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+
 // 1 when the column-parallel kernel ran; 0 for shapes it does not cover (dv not a multiple of 32,
 // dk not a multiple of 4 or above 128) or when SHAINET_GDR_COLS=0, leaving the per-head kernel.
 static int gated_delta_rule_cols(const float* q, const float* k, const float* v,
@@ -3151,6 +3402,8 @@ void gated_delta_rule(const float* q, const float* k, const float* v,
                       int seq, int nv, int nk, int dk, int dv, int heads_per_k, float q_scale,
                       int k_head_tiled) {
     if (seq <= 0 || nv <= 0) return;
+    if (gated_delta_rule_chunked(q, k, v, alpha, beta, state, out, seq, nv, nk, dk, dv, heads_per_k,
+                                 q_scale, k_head_tiled)) return;
     if (gated_delta_rule_cols(q, k, v, alpha, beta, state, out, seq, nv, nk, dk, dv, heads_per_k,
                               q_scale, k_head_tiled)) return;
     int threads = 128;
