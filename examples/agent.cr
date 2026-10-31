@@ -4,6 +4,7 @@ require "colorize"
 require "readline"
 require "./agent_workspace"
 require "./agent_v4a"
+require "./agent_markdown"
 
 # Agentic chat demo: a multi-turn conversation with a growing context and a
 # tool-calling loop, built entirely on Network#run. Think of it as a very light
@@ -199,6 +200,13 @@ module AgentDemo
   # exported by default, shelling out to `tput` costs a process per query, and the ANSI size report
   # ("\e[18t") would have to read its answer from stdin, which is where steering is listening.
   TIOCGWINSZ = {% if flag?(:darwin) %}0x40087468_u64{% else %}0x5413_u64{% end %}
+
+  # Columns of the terminal on stderr, or 100 when it is not one.
+  def self.term_cols : Int32
+    ws = LibWinsize::Winsize.new
+    return 100 if LibWinsize.ioctl(STDERR.fd, TIOCGWINSZ, pointerof(ws).as(Void*)) != 0 || ws.ws_col == 0
+    ws.ws_col.to_i
+  end
 
   # Bytes waiting on a descriptor, used to poll stdin without blocking. IO.select does not exist in
   # Crystal, and a background reader fiber would compete with the confirmation prompt for the same
@@ -759,6 +767,9 @@ module AgentDemo
     SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏]
 
     def initialize(@io : IO)
+      # The answer is rendered as markdown; "Agent ❯ " is already on the line, hence col0 false.
+      tty = @io.is_a?(IO::FileDescriptor) && @io.as(IO::FileDescriptor).tty?
+      @md = AgentDemo::Markdown.new(@io, ->{ AgentDemo.term_cols }, Colorize.enabled? && tty, col0: false)
       @mode = :normal
       @pending = ""
       @started = false
@@ -796,6 +807,7 @@ module AgentDemo
       clear_status
       emit(@pending)
       @pending = ""
+      @md.finish
     end
 
     private def emit(t : String)
@@ -824,8 +836,10 @@ module AgentDemo
         @started = true
       end
       case @mode
-      when :think  then @io.print t.colorize(:dark_gray)
-      when :normal then @io.print t
+      when :think
+        @io.print t.colorize(:dark_gray)
+        @md.col0 = t.ends_with?('\n')
+      when :normal then @md.feed(t)
       end
       @io.flush
     end
@@ -840,9 +854,9 @@ module AgentDemo
 
     private def apply(action)
       case action
-      when :think_open  then @mode = :think
+      when :think_open  then @md.finish; @mode = :think
       when :think_close then @mode = :normal
-      when :tool_open   then @tool_chars = 0; @mode = :tool
+      when :tool_open   then @md.finish; @tool_chars = 0; @mode = :tool
       when :tool_close  then clear_status; @mode = :normal
       end
     end
@@ -1857,9 +1871,9 @@ module AgentDemo
         generated << id
         # Decoded unconditionally, not just when echoing: the tool-call state above is derived from
         # it, so a non-echoing call (/ask) needs it too.
-        full = @tokenizer.decode(generated).scrub
+        full = AgentDemo.complete_utf8(@tokenizer.decode(generated))
         if r = renderer
-          r.feed(full[prev.size..]) if full.size > prev.size
+          r.feed(full.byte_slice(prev.bytesize)) if full.bytesize > prev.bytesize
         end
         prev = full
         logits = @net.run([id], stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
