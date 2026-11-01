@@ -262,6 +262,9 @@ module SHAInet
     private def encode_hf(text : String) : Array(Int32)
       ids = Array(Int32).new
       return ids if text.empty?
+      # The splitting regexes raise on invalid UTF-8; byte-level BPE could encode the raw bytes, but
+      # a tokenizer must not take the caller down over a stray byte, so invalid sequences become U+FFFD.
+      text = text.scrub unless text.valid_encoding?
       if lit = @literal_regex
         pos = 0
         while m = lit.match(text, pos)

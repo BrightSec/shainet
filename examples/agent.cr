@@ -35,6 +35,12 @@ lib LibWinsize
   fun ioctl(fd : LibC::Int, request : LibC::ULong, arg : Void*) : LibC::Int
 end
 
+@[Link("readline")]
+lib LibRLHook
+  $rl_startup_hook : -> LibC::Int
+  fun rl_insert_text(text : LibC::Char*) : LibC::Int
+end
+
 module AgentDemo
   MAX_READ_BYTES = 64_000
 
@@ -175,22 +181,166 @@ module AgentDemo
     s
   end
 
-  # Poll stdin without blocking. Only ever called from inside the token loop, which is the one place
-  # where nothing else is reading stdin: the confirmation prompt and the REPL both read between
-  # generations, never during one, so there is no second reader to race for the line.
-  def self.poll_steer : Bool
-    return false unless STDIN.tty?
+  def self.steer_pending? : Bool
+    !@@steer.nil?
+  end
+
+  # ---- The steering input line ----------------------------------------------------------------------
+  #
+  # Steering used to be read in the terminal's normal line mode: keystrokes echoed wherever the output
+  # cursor happened to be, so a correction typed mid-answer was smeared through the streaming text,
+  # and nothing reached the agent until Enter. Now, while a turn runs, the terminal is put in
+  # non-canonical, no-echo mode (signals stay on, so Ctrl-C still cancels), keystrokes are read as
+  # they arrive and drawn on a row of their own above the status bar, and Enter delivers the line.
+  #
+  # Reads happen only when FIONREAD says bytes are waiting, never blocking: directly from the decode
+  # loop and the prefill progress callback (the GPU phases, where no fiber runs), and from a small
+  # fiber during tool execution, which waits on the event loop. The approval prompt and readline get
+  # the normal mode back for as long as they read.
+  @@steer_mode = false
+  @@saved_termios = LibC::Termios.new
+  @@typed = ""
+  @@esc = ""
+  @@utf8 = [] of UInt8
+  @@in_paste = false
+  @@prefill_line : String? = nil
+
+  def self.steer_mode_on
+    return if @@steer_mode || !STDIN.tty?
+    t = LibC::Termios.new
+    return if LibC.tcgetattr(STDIN.fd, pointerof(t)) != 0
+    @@saved_termios = t
+    t.c_lflag &= ~(LibC::ECHO | LibC::ICANON)
+    t.c_cc[LibC::VMIN] = 0
+    t.c_cc[5] = 0 # VTIME
+    return if LibC.tcsetattr(STDIN.fd, LibC::TCSANOW, pointerof(t)) != 0
+    @@steer_mode = true
+    @@typed = ""
+    @@esc = ""
+    @@utf8.clear
+    @@in_paste = false
+    BAR.input = ""
+    BAR.input_active = true
+    spawn do
+      while @@steer_mode
+        pump_input
+        sleep 40.milliseconds
+      end
+    end
+  end
+
+  # Back to the terminal's normal mode. Unsent text is kept for the next prompt.
+  def self.steer_mode_off
+    return unless @@steer_mode
+    pump_input
+    @@steer_mode = false
+    t = @@saved_termios
+    LibC.tcsetattr(STDIN.fd, LibC::TCSANOW, pointerof(t))
+    @@prefill_line = @@typed unless @@typed.strip.empty?
+    @@typed = ""
+    BAR.input_active = false
+  end
+
+  # Run the block in normal terminal mode (an approval prompt reading a line), then resume.
+  def self.with_cooked(&)
+    was = @@steer_mode
+    steer_mode_off if was
+    begin
+      yield
+    ensure
+      if was
+        # Whatever was half-typed before the prompt goes back on the input line.
+        keep = @@prefill_line
+        @@prefill_line = nil
+        steer_mode_on
+        if keep
+          @@typed = keep
+          BAR.input = keep
+        end
+      end
+    end
+  end
+
+  # Text typed during the last turn and never sent; readline offers it pre-filled.
+  def self.take_prefill_line : String?
+    l = @@prefill_line
+    @@prefill_line = nil
+    l
+  end
+
+  def self.pump_input
+    return unless @@steer_mode
     pending = 0
-    return false if LibWinsize.ioctl(STDIN.fd, FIONREAD, pointerof(pending).as(Void*)) != 0
-    return false if pending <= 0
-    line = STDIN.gets
-    return false if line.nil?
-    text = line.chomp.strip
-    return false if text.empty?
-    @@steer = text
-    true
+    return if LibWinsize.ioctl(STDIN.fd, FIONREAD, pointerof(pending).as(Void*)) != 0
+    return if pending <= 0
+    buf = Bytes.new(pending)
+    n = LibC.read(STDIN.fd, buf, pending)
+    return if n <= 0
+    before = @@typed
+    buf[0, n].each { |byte| input_byte(byte) }
+    BAR.input = @@typed if @@typed != before || steer_pending?
   rescue
-    false
+  end
+
+  private def self.input_byte(b : UInt8)
+    unless @@esc.empty? && b != 0x1b
+      @@esc += b.chr
+      seq = @@esc
+      done = if seq.size == 1
+               false
+             elsif seq[1] == '['
+               seq.size > 2 && (0x40..0x7e).includes?(seq[-1].ord)
+             elsif seq[1] == 'O'
+               seq.size >= 3
+             else
+               true
+             end
+      if done
+        @@in_paste = true if seq == PASTE_START
+        @@in_paste = false if seq == PASTE_END
+        @@esc = ""
+      end
+      return
+    end
+    if b >= 0x80
+      @@utf8 << b
+      lead = @@utf8[0]
+      need = lead >= 0xF0 ? 4 : (lead >= 0xE0 ? 3 : (lead >= 0xC0 ? 2 : 1))
+      if @@utf8.size >= need
+        str = String.new(Slice.new(@@utf8.to_unsafe, @@utf8.size))
+        @@typed += str if str.valid_encoding?
+        @@utf8.clear
+      end
+      return
+    end
+    case b
+    when 13, 10
+      if @@in_paste
+        @@typed += " "
+      else
+        text = @@typed.strip
+        @@typed = ""
+        @@steer = text unless text.empty?
+      end
+    when 127, 8
+      @@typed = @@typed.rchop unless @@typed.empty?
+    when 21 # Ctrl-U
+      @@typed = ""
+    when 23 # Ctrl-W
+      @@typed = @@typed.rstrip.sub(/\S+\z/, "")
+    when 9
+      @@typed += " "
+    else
+      @@typed += b.chr if b >= 32
+    end
+  end
+
+  # readline's startup hook: insert the carried-over line so it can be edited and sent.
+  def self.readline_prefill : LibC::Int
+    if l = take_prefill_line
+      LibRLHook.rl_insert_text(l)
+    end
+    0
   end
 
   # Terminal size, via ioctl(TIOCGWINSZ).
@@ -232,34 +382,71 @@ module AgentDemo
   class StatusBar
     @text = ""
     @installed = false
+    # Size the scroll region was set for; a different size on the next draw means a resize.
+    @rows = 0
+    @cols = 0
+    # The steering input line, the row above the status line. Active while a turn runs.
+    @input = ""
+    @input_active = false
+
+    # Rows kept out of the scroll region: the input line and the status line.
+    RESERVED = 2
 
     def initialize(@io : IO::FileDescriptor)
       @tty = @io.tty?
     end
 
-    # Reserve the bottom line. Safe to call when not on a tty: it does nothing and every other method
+    # Reserve the bottom rows. Safe to call when not on a tty: it does nothing and every other method
     # degrades to a no-op, which is the same gate Colorize.enabled uses.
     def install
       return unless @tty && (size = term_size)
-      rows, _ = size
-      return if rows < 3            # too short to give a line away
-      @io.print "\e[1;#{rows - 1}r" # scroll region excludes the last row
-      @io.print "\e[#{rows - 1};1H" # put the cursor inside it
+      rows, cols = size
+      return if rows < RESERVED + 2 # too short to give lines away
+      @io.print "\n" * RESERVED     # make room so nothing on screen is under the reserved rows
+      @io.print "\e[1;#{rows - RESERVED}r"
+      @io.print "\e[#{rows - RESERVED};1H"
       @io.flush
+      @rows, @cols = rows, cols
       @installed = true
+      paint(rows, cols)
     end
 
-    # Release the line and restore the terminal. Registered with at_exit, because a process that dies
+    # Re-fit the region after a terminal resize. Called from draw, the SIGWINCH trap and before each
+    # prompt; a no-op while the size is unchanged.
+    #
+    # The region is set in absolute rows, so a resize left it describing the OLD terminal: on a taller
+    # window the reserved rows sat in the middle of the output, on a shorter one the region ran past
+    # the bottom (or the terminal reset it to full screen), and from then on every bar redraw wrote
+    # over real text and scrolling no longer avoided the bar -- the screen turned to garbage.
+    #
+    # The cursor's row is unknown here (asking the terminal means reading stdin, where steering and
+    # readline listen), so the fix works without it. With full-screen scrolling, RESERVED newlines
+    # then as many cursor-ups is a no-op unless the cursor is within RESERVED rows of the bottom, in
+    # which case the screen scrolls just enough to free those rows and the cursor keeps its column.
+    # DECSTBM homes the cursor, hence the save/restore around it.
+    def refresh
+      return unless @installed && (size = term_size)
+      rows, cols = size
+      return if rows == @rows && cols == @cols
+      @rows, @cols = rows, cols
+      return if rows < RESERVED + 2
+      @io.print "\e7\e[r\e8"
+      @io.print "\n" * RESERVED + "\e[#{RESERVED}A"
+      @io.print "\e7\e[1;#{rows - RESERVED}r\e8"
+      paint(rows, cols)
+    end
+
+    # Release the rows and restore the terminal. Registered with at_exit, because a process that dies
     # with a scroll region set leaves the user's shell scrolling in a box.
     def uninstall
       return unless @installed
       @installed = false
       if size = term_size
         rows, _ = size
-        @io.print "\e[r"               # full-screen scrolling again
-        @io.print "\e[#{rows};1H\e[2K" # wipe the bar
-        @io.print "\e[?25h"            # cursor visible
-        @io.print "\e[#{rows};1H"
+        @io.print "\e[r" # full-screen scrolling again
+        RESERVED.times { |i| @io.print "\e[#{rows - i};1H\e[2K" }
+        @io.print "\e[?25h" # cursor visible
+        @io.print "\e[#{rows - RESERVED + 1};1H"
       end
       @io.flush
     end
@@ -267,6 +454,16 @@ module AgentDemo
     def text=(t : String)
       return if t == @text
       @text = t
+      draw
+    end
+
+    def input=(t : String)
+      @input = t
+      draw
+    end
+
+    def input_active=(v : Bool)
+      @input_active = v
       draw
     end
 
@@ -278,16 +475,45 @@ module AgentDemo
       @io.print "\e[?25h" if @installed
     end
 
-    # Re-queries the size on every draw rather than caching it, so a resize is picked up for free.
+    # Re-queries the size on every draw, re-fitting the scroll region first if it changed.
     private def draw
       return unless @installed && (size = term_size)
       rows, cols = size
+      if rows != @rows || cols != @cols
+        refresh # re-fits the region and paints
+        return
+      end
+      paint(rows, cols)
+    end
+
+    private def paint(rows : Int32, cols : Int32)
       body = @text.size > cols ? @text[0, cols] : @text.ljust(cols)
-      @io.print "\e7"                # save cursor
-      @io.print "\e[#{rows};1H\e[2K" # go to the bar row, clear it
+      @io.print "\e7" # save cursor
+      @io.print "\e[#{rows - 1};1H\e[2K"
+      @io.print input_line(cols)
+      @io.print "\e[#{rows};1H\e[2K"
       @io.print body.colorize(:dark_gray)
       @io.print "\e8" # restore cursor
       @io.flush
+    end
+
+    # "› text▏" while a turn runs (the tail of a long line, so the end being typed stays visible), a
+    # hint when nothing is typed yet, and a plain rule between turns, when readline has the prompt.
+    private def input_line(cols : Int32) : String
+      unless @input_active
+        return ("─" * cols).colorize(:dark_gray).to_s
+      end
+      prompt = "› "
+      if @input.empty?
+        return "#{prompt.colorize(:light_green)}#{"type to steer · Enter sends · Ctrl-C stops the turn".colorize(:dark_gray)}"
+      end
+      room = cols - prompt.size - 2
+      shown = @input
+      while AgentDemo::TermWidth.of(shown) > room && !shown.empty?
+        shown = shown[1..]
+      end
+      shown = "…" + shown[1..] if shown.size < @input.size && !shown.empty?
+      "#{prompt.colorize(:light_green)}#{shown}\e[7m \e[0m"
     end
 
     private def term_size
@@ -418,9 +644,11 @@ module AgentDemo
   def self.confirm?(desc : String) : Bool
     return true if ENV.fetch("SHAINET_AGENT_YOLO", "0") == "1"
     return true if @@allow_all
-    STDERR.print "  #{"⚠ allow".colorize(:yellow)} #{desc}? [y/N/a=all] "
-    STDERR.flush
-    ans = gets
+    ans = with_cooked do
+      STDERR.print "  #{"⚠ allow".colorize(:yellow)} #{desc}? [y/N/a=all] "
+      STDERR.flush
+      gets
+    end
     # EOF (piped input, closed stdin) must not read as approval.
     return false unless ans
     case ans.strip.downcase
@@ -1776,6 +2004,7 @@ module AgentDemo
         pct = layer_idx * 100 // total_layers
         STDERR.print "\r  prefill layer #{layer_idx}/#{total_layers} (#{pct}%) · #{elapsed.round(0).to_i}s".colorize(:dark_gray)
         STDERR.flush
+        AgentDemo.pump_input
         nil
       end
       while i < ids.size
@@ -1837,7 +2066,8 @@ module AgentDemo
         # Steering: a line typed during generation stops it and is delivered as the next message.
         # Polled every 8 tokens rather than every one because it is a syscall, and 8 tokens is well
         # under a second of latency at this model's speed.
-        if generated.size % 8 == 0 && AgentDemo.poll_steer
+        AgentDemo.pump_input
+        if AgentDemo.steer_pending?
           STDERR.puts "\n  #{"steering".colorize(:cyan)}"
           break
         end
@@ -2076,6 +2306,12 @@ module AgentDemo
             else
               "Error: unknown tool #{c.name}"
             end
+          # Tool output is arbitrary bytes -- a compiler's or a binary's output is not always UTF-8 --
+          # and every regex downstream (the tokenizer's pre-split, the result summary, the markdown
+          # renderer) raises on invalid UTF-8 rather than skipping it. Observed: a run_command whose
+          # output held a stray 0x80 byte killed the whole agent with "Regex match error". Scrubbed
+          # once here, where untrusted text enters the conversation.
+          result = result.scrub
           @messages << Message.new("tool", clamp_tool_result(result))
           STDERR.puts "    #{AgentDemo.summarize_result(result).colorize(:dark_gray)}"
         end
@@ -2300,6 +2536,12 @@ BAR.install
 # Registered before the paste reset so the terminal is restored even on an abrupt exit: a process that
 # dies with a scroll region still set leaves the user's shell scrolling inside a box.
 at_exit { BAR.uninstall }
+# The trap runs in a fiber, so it fires when the scheduler next gets control: every generated token
+# yields, and readline (which handles the resize for its own line) returns before the next prompt,
+# where the loop calls refresh as well.
+Signal::WINCH.trap { BAR.refresh }
+# Text typed during a turn but never sent comes back pre-filled at the next prompt.
+LibRLHook.rl_startup_hook = ->{ AgentDemo.readline_prefill }
 at_exit { AgentDemo.disable_bracketed_paste }
 at_exit { AgentDemo.save_history }
 agent.status_bar = BAR
@@ -2307,9 +2549,18 @@ agent.status_bar = BAR
 loop do
   # No manual "You ❯" print here: readline draws PROMPT itself so its line editing works within it.
   # On a pipe (no tty) read_submission falls back to gets, and a leading newline keeps turns spaced.
+  BAR.refresh
   STDERR.print "\n" if STDIN.tty?
-  input = AgentDemo.read_submission
+  # A line sent with Enter after the turn's last generation had already finished: nothing consumed it
+  # as steering, so it is the next message.
+  if late = AgentDemo.take_steer
+    STDERR.puts "#{AgentDemo::PROMPT}#{late}"
+    input = late
+  else
+    input = AgentDemo.read_submission
+  end
   break if input.nil?
+  input = input.scrub
   idle_interrupt = false
   AgentDemo.clear_cancel!
   input = input.strip
@@ -2383,9 +2634,11 @@ loop do
   end
 
   AgentDemo.generating = true
+  AgentDemo.steer_mode_on
   begin
     agent.chat(input, max_tokens)
   ensure
+    AgentDemo.steer_mode_off
     AgentDemo.generating = false
   end
   STDERR.puts "  #{agent.status}".colorize(:dark_gray)

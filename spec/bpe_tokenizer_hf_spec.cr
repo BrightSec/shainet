@@ -53,3 +53,12 @@ describe "BPETokenizer (byte-level)" do
     ids.should eq([tok.vocab["a"], 1000, tok.vocab["b"]])
   end
 end
+
+describe "BPETokenizer (byte-level) with invalid UTF-8" do
+  it "encodes instead of raising" do
+    tok = byte_tokenizer([] of Tuple(String, String))
+    tok.pre_tokenizer = "qwen35"
+    bad = String.new(Bytes[0x61, 0x80, 0x62])
+    tok.encode(bad).should_not be_empty
+  end
+end
