@@ -109,15 +109,6 @@ module ToolProtocol
     text.split("<tool_call>").size > text.split("</tool_call>").size
   end
 
-  # True when a reasoning block was opened and never closed.
-  #
-  # The same counting approach as truncated? and for the same reason: it is unambiguous where inspecting
-  # the prose is guesswork. Used to decide whether stopping at the caller's token cap would land inside a
-  # thought, which is the one place a cap is guaranteed to produce an empty answer.
-  def self.truncated_think?(text : String) : Bool
-    text.split("<think>").size > text.split("</think>").size
-  end
-
   # Turn parsed arguments into the JSON object string an OpenAI client expects in
   # `tool_calls[].function.arguments`, which it will JSON.parse.
   #

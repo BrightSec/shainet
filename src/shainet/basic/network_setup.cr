@@ -206,6 +206,53 @@ module SHAInet
       end
     end
 
+    # Position the cache was saved at by save_cache!, or nil when there is no saved point.
+    @saved_cache_positions : Int32? = nil
+
+    # Save a point the cache can be rewound to: `positions` tokens, which must be every token the
+    # cache holds right now (call it straight after a prefill, before generating).
+    #
+    # Attention blocks need nothing saved, since their KV cache can be cut back to a length. Gated
+    # DeltaNet blocks fold every token into their recurrent state, so each one keeps a copy (in host
+    # memory). One saved point at a time; saving again replaces it.
+    def save_cache!(positions : Int32)
+      llama_cache_blocks.each do |b|
+        unless b.cached_length == positions
+          drop_saved_cache!
+          raise ArgumentError.new("save_cache!(#{positions}) but an attention block holds #{b.cached_length} positions")
+        end
+      end
+      CUDA.device_synchronize if CUDA.fully_available?
+      gdn_cache_blocks.each(&.save_state!)
+      @saved_cache_positions = positions
+    end
+
+    # Rewind the cache to the saved point and return its position, or return nil (changing nothing)
+    # when there is no saved point or an attention block no longer reaches it -- the caller then
+    # clears the cache and prefills from scratch.
+    def restore_cache! : Int32?
+      pos = @saved_cache_positions
+      return unless pos
+      blocks = llama_cache_blocks
+      return if blocks.any? { |b| b.cached_length < pos }
+      blocks.each(&.truncate_cache!(pos))
+      gdn_cache_blocks.each(&.restore_saved_state!)
+      pos
+    end
+
+    def drop_saved_cache!
+      @saved_cache_positions = nil
+      gdn_cache_blocks.each(&.drop_saved_state!)
+    end
+
+    private def llama_cache_blocks : Array(LlamaBlock)
+      @transformer_layers.compact_map { |l| l.as(LlamaBlock) if l.is_a?(LlamaBlock) }
+    end
+
+    private def gdn_cache_blocks : Array(GatedDeltaNetBlock)
+      @hidden_layers.compact_map { |l| l.as(GatedDeltaNetBlock) if l.is_a?(GatedDeltaNetBlock) }
+    end
+
     # Quantize all LLaMA block weights and the lm_head on the GPU to the given
     # bit width: bits == 8 -> Q8_0 (int8), bits == 4 -> Q4_0 (4-bit), both with
     # per-32-block fp32 scales. Opt-in; the fp32 path is untouched. Requires CUDA

@@ -27,6 +27,45 @@ describe SHAInet::Sampler do
     end
   end
 
+  describe "top_p" do
+    it "samples only from the smallest set reaching top_p" do
+      # Probabilities ~0.84, 0.11, 0.04, ...: top_p 0.9 keeps the first two, never the rest.
+      m = logits_row([4.0_f32, 2.0_f32, 1.0_f32, 0.5_f32, 0.0_f32])
+      s = SHAInet::Sampler.new(temperature: 1.0, top_k: 5, top_p: 0.9, rng: Random.new(5))
+      picks = Array.new(500) { s.sample(m) }
+      picks.all? { |id| id <= 1 }.should be_true
+      picks.includes?(1).should be_true
+    end
+
+    it "always keeps the top token, however small top_p is" do
+      m = logits_row([1.0_f32, 0.9_f32, 0.8_f32])
+      s = SHAInet::Sampler.new(temperature: 1.0, top_k: 3, top_p: 0.01, rng: Random.new(2))
+      50.times { s.sample(m).should eq(0) }
+    end
+
+    it "rejects a top_p outside (0, 1]" do
+      expect_raises(ArgumentError) { SHAInet::Sampler.new(top_p: 0.0) }
+      expect_raises(ArgumentError) { SHAInet::Sampler.new(top_p: 1.5) }
+    end
+  end
+
+  describe "#apply_presence_frequency!" do
+    it "subtracts presence once and frequency per occurrence" do
+      m = logits_row([5.0_f32, 5.0_f32, 5.0_f32])
+      s = SHAInet::Sampler.new
+      s.apply_presence_frequency!(m, {0 => 1, 1 => 3}, presence: 0.5, frequency: 0.25)
+      m.data[0].should eq(4.25_f32) # 5 - 0.5 - 0.25
+      m.data[1].should eq(3.75_f32) # 5 - 0.5 - 0.75
+      m.data[2].should eq(5.0_f32)  # never generated
+    end
+
+    it "is a no-op when both are zero" do
+      m = logits_row([1.0_f32, 2.0_f32])
+      SHAInet::Sampler.new.apply_presence_frequency!(m, {0 => 4}, 0.0, 0.0)
+      m.data[0].should eq(1.0_f32)
+    end
+  end
+
   describe "#sample" do
     it "is deterministic with a seeded RNG" do
       m = logits_row([1.0_f32, 2.0_f32, 3.0_f32, 0.5_f32, -2.0_f32])

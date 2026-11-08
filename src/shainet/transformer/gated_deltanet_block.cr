@@ -174,6 +174,92 @@ module SHAInet
       end
     end
 
+    # One saved copy of the recurrent state, for rewinding a sequence to the point it was taken.
+    #
+    # Recurrent state cannot be truncated the way a KV cache can: every token is folded into it, so
+    # the only way back to an earlier position is a copy made at that position. Device state is copied
+    # to HOST memory, so the copy costs no VRAM, and the buffers are reused between saves.
+    @saved = false
+    @saved_state = [] of SimpleMatrix?
+    @saved_conv_q : SimpleMatrix?
+    @saved_conv_k : SimpleMatrix?
+    @saved_conv_v : SimpleMatrix?
+    @saved_dev_state : Bytes?
+    @saved_dev_present = false
+    @saved_conv_devs = {} of Symbol => Bytes
+
+    # Save the current recurrent state (host and device) into this block's single save slot.
+    def save_state!
+      @saved_state = @state.map { |m| m.try(&.clone) }
+      @saved_conv_q = @conv_state_q.try(&.clone)
+      @saved_conv_k = @conv_state_k.try(&.clone)
+      @saved_conv_v = @conv_state_v.try(&.clone)
+      if m = @dev_state
+        @saved_dev_state = GatedDeltaNetBlock.device_to_host(m, @saved_dev_state)
+        @saved_dev_present = true
+      else
+        @saved_dev_present = false
+      end
+      @saved_conv_devs.select! { |role, _| @conv_state_devs.has_key?(role) }
+      @conv_state_devs.each do |role, m|
+        @saved_conv_devs[role] = GatedDeltaNetBlock.device_to_host(m, @saved_conv_devs[role]?)
+      end
+      @saved = true
+    end
+
+    # Replace the current state with the saved one. Returns false, changing nothing, when nothing was
+    # saved. The slot is kept, so the same point can be restored again.
+    def restore_saved_state! : Bool
+      return false unless @saved
+      @num_v_heads.times { |h| @state[h] = @saved_state[h]?.try(&.clone) }
+      @conv_state_q = @saved_conv_q.try(&.clone)
+      @conv_state_k = @saved_conv_k.try(&.clone)
+      @conv_state_v = @saved_conv_v.try(&.clone)
+      # Device buffers are written in place: same shapes every time, so no reallocation per request.
+      if @saved_dev_present && (bytes = @saved_dev_state)
+        GatedDeltaNetBlock.host_to_device(device_state, bytes)
+      else
+        @dev_state.try(&.free!)
+        @dev_state = nil
+      end
+      @conv_state_devs.each do |role, m|
+        if bytes = @saved_conv_devs[role]?
+          GatedDeltaNetBlock.host_to_device(m, bytes)
+        else
+          # Created after the save, so at the saved point it did not exist yet: fresh means zero.
+          m.zero!
+          m.mark_host_modified!
+          m.sync_to_device!("gdn_conv_state_restore")
+        end
+      end
+      true
+    end
+
+    # Forget the saved state.
+    def drop_saved_state!
+      @saved = false
+    end
+
+    # Copy a device matrix's float32 contents into `buf` (reused when it is the right size).
+    protected def self.device_to_host(m : CudaMatrix, buf : Bytes?) : Bytes
+      size = m.rows.to_i64 * m.cols * 4
+      buf = Bytes.new(size) unless buf && buf.size == size
+      ptr = m.device_ptr || raise "GDN state has no device buffer"
+      r = CUDA.memcpy(buf.to_unsafe.as(Pointer(Void)), ptr.as(Pointer(Void)), size.to_u64, CUDA::MemcpyKind::DeviceToHost)
+      raise "GDN state copy to host failed (#{r})" unless r.nil? || r == 0
+      buf
+    end
+
+    protected def self.host_to_device(m : CudaMatrix, buf : Bytes) : Nil
+      size = m.rows.to_i64 * m.cols * 4
+      raise "GDN state size changed (#{buf.size} saved, #{size} now)" unless buf.size == size
+      ptr = m.device_ptr || raise "GDN state has no device buffer"
+      r = CUDA.memcpy(ptr.as(Pointer(Void)), buf.to_unsafe.as(Pointer(Void)), size.to_u64, CUDA::MemcpyKind::HostToDevice)
+      raise "GDN state copy to device failed (#{r})" unless r.nil? || r == 0
+      # The device copy is now the newer one; the host mirror is stale.
+      m.mark_device_dirty!
+    end
+
     # Bytes of recurrent state held, for comparison against a KV cache.
     def state_bytes : Int64
       per_head = (@head_v * @head_k * 4).to_i64

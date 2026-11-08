@@ -19,18 +19,38 @@ module SHAInet
     property temperature : Float64
     property top_k : Int32
     property repetition_penalty : Float64
+    # Nucleus sampling: after top-k, keep the smallest set of tokens whose probability sums to at
+    # least top_p. 1.0 disables it.
+    property top_p : Float64
     property rng : Random
 
     @ids : Array(Int32)
     @vals : Array(Float64)
 
     def initialize(@temperature : Float64 = 1.0, @top_k : Int32 = 40,
-                   @repetition_penalty : Float64 = 1.0, @rng : Random = Random.new)
+                   @repetition_penalty : Float64 = 1.0, @rng : Random = Random.new,
+                   @top_p : Float64 = 1.0)
       raise ArgumentError.new("top_k must be >= 1") unless @top_k >= 1
       raise ArgumentError.new("temperature must be > 0") unless @temperature > 0.0
+      raise ArgumentError.new("top_p must be in (0, 1]") unless 0.0 < @top_p <= 1.0
       # Reused across calls; capacity fixed at top_k so no per-token growth.
       @ids = Array(Int32).new(@top_k)
       @vals = Array(Float64).new(@top_k)
+    end
+
+    # OpenAI presence/frequency penalties: subtract `presence` once from every token already generated
+    # and `frequency` per occurrence. `counts` maps token id to how often it has been generated; the
+    # caller keeps it up to date, so this costs one pass over the distinct tokens.
+    def apply_presence_frequency!(logits : SimpleMatrix, counts : Hash(Int32, Int32),
+                                  presence : Float64, frequency : Float64,
+                                  row : Int32 = logits.rows - 1) : Nil
+      return if presence == 0.0 && frequency == 0.0
+      cols = logits.cols
+      ptr = logits.data.to_unsafe + row.to_i64 * cols
+      counts.each do |id, n|
+        next unless 0 <= id < cols
+        ptr[id] = (ptr[id] - presence - frequency * n).to_f32
+      end
     end
 
     # Greedy argmax over a logits row, skipping non-finite values (NaN/Inf).
@@ -130,6 +150,18 @@ module SHAInet
         vp[i] = e
         sum += e
         i += 1
+      end
+      # Nucleus cut: values are in descending order, so the kept set is a prefix. Always at least one.
+      if @top_p < 1.0
+        keep = 0
+        acc = 0.0
+        while keep < szk
+          acc += vp[keep]
+          keep += 1
+          break if acc >= @top_p * sum
+        end
+        szk = keep
+        sum = acc
       end
       inv_sum = 1.0 / sum
 

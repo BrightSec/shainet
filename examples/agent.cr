@@ -5,6 +5,7 @@ require "readline"
 require "./agent_workspace"
 require "./agent_v4a"
 require "./agent_markdown"
+require "./qwen_thinking"
 
 # Agentic chat demo: a multi-turn conversation with a growing context and a
 # tool-calling loop, built entirely on Network#run. Think of it as a very light
@@ -1614,7 +1615,11 @@ module AgentDemo
       ["<|endoftext|>", "<|end_of_text|>"].each { |n| (id = @tokenizer.vocab[n]?) && @stop_ids << id }
       @system_block = AgentDemo.render_tools_block(@tools)
       @recent_calls = [] of String
-      @sampler = SHAInet::Sampler.new(temperature: 0.3, top_k: 20, repetition_penalty: 1.1)
+      # Qwen3.8's recommended thinking-mode sampling (model card): temperature 1.0, top_p 0.95,
+      # top_k 20, no presence or repetition penalty. The previous 0.3 was close to greedy, which Qwen
+      # warns degrades thinking-mode output and causes endless repetition -- the loops this agent hit.
+      @sampler = SHAInet::Sampler.new(temperature: QwenThinking::TEMPERATURE, top_k: QwenThinking::TOP_K,
+        top_p: QwenThinking::TOP_P)
       @messages = [] of Message
     end
 
@@ -1647,10 +1652,14 @@ module AgentDemo
       ids
     end
 
+    # Qwen3.8's template opens the system message with the reasoning-effort line; xhigh is its default.
+    THINKING = QwenThinking.mode(nil)
+
     private def system_ids : Array(Int32)
-      render_message("system", "#{@system_block}\n\n<WORKSPACE>\nAll relative paths resolve " \
-                               "against #{AgentDemo.workspace}\nThis is a #{AgentDemo.host_os} host. You are already in that " \
-                               "directory — do not cd to it, and never search the filesystem for it.\n</WORKSPACE>")
+      body = "#{@system_block}\n\n<WORKSPACE>\nAll relative paths resolve " \
+             "against #{AgentDemo.workspace}\nThis is a #{AgentDemo.host_os} host. You are already in that " \
+             "directory — do not cd to it, and never search the filesystem for it.\n</WORKSPACE>"
+      render_message("system", QwenThinking.with_instruction(body, THINKING))
     end
 
     # Tokens every prompt carries regardless of the conversation: the system message (with the tool
@@ -1900,10 +1909,12 @@ module AgentDemo
 
     TRUNCATION_MARKER = "[Earlier conversation was truncated to fit the context window.]"
 
-    # Tokens a turn keeps free for the model's reply. Bounded by a quarter of the window so a large
-    # max_tokens on a small window does not make every turn compact.
-    def reply_reserve(max_tokens : Int32) : Int32
-      Math.min(max_tokens, @max_context // 4)
+    # Tokens a turn keeps free for the model's reply before compacting. A quarter of the window: the
+    # turn itself is bounded only by the window (there is no per-reply token cap), so this is a
+    # headroom heuristic, not a hard reply size -- it keeps a session from starting a turn with almost
+    # no room for the reasoning, the answer and a tool round-trip.
+    def reply_reserve : Int32
+      @max_context // 4
     end
 
     # One-line status: context usage, VRAM, expert-cache hit rate.
@@ -2033,6 +2044,11 @@ module AgentDemo
 
     # Generate from an explicit prompt. When echo is set, the user-facing prose is streamed
     # live (with <think> and tool-call markup filtered out).
+    #
+    # The only ceiling is `max_tokens` clamped to the room left in the context window. A turn passes
+    # the whole window (see `generate`), so the model may think for as long as the window holds and
+    # stops for real only on a stop token, a user interrupt (Ctrl-C/steer), or the window filling.
+    # Summaries pass a small `max_tokens` (SUMMARY_TOKENS) to stay bounded.
     private def generate_from(prompt : Array(Int32), max_tokens : Int32, echo : Bool = false) : Tuple(String, Array(Int32))
       # Never generate past the KV budget: the cache is pinned at @max_context, and running into it
       # mid-reply raises out of the decode loop and loses the turn.
@@ -2082,19 +2098,6 @@ module AgentDemo
                      "#{rate.round(1)} tok/s · #{secs.round(0).to_i}s"
         end
         row = logits.rows - 1
-        # The repetition penalty must NOT run inside a tool call.
-        #
-        # Tool-call syntax is repetitive BY DESIGN -- <function=read_file> and </function> share the
-        # token "function", every argument repeats <parameter= and </parameter>. With window 20 the
-        # tokens needed to CLOSE the call are still inside the window from opening it, so they get
-        # penalised exactly when they are the only correct choice, and the sampler takes <|im_end|>
-        # instead. Observed: generation stopped 81 characters in, immediately after </parameter>,
-        # leaving </function></tool_call> unwritten and the call unparseable.
-        #
-        # Prose still gets the penalty, which is where it earns its keep.
-        unless AgentDemo.truncated_tool_call?(prev)
-          @sampler.apply_repetition_penalty!(logits, generated, window: 20, row: row)
-        end
         id = @sampler.sample(logits, row)
         break if id < 0 || @stop_ids.includes?(id)
         break unless logits[row, id].finite?
@@ -2117,14 +2120,19 @@ module AgentDemo
       {@tokenizer.decode(generated).scrub, generated}
     end
 
-    # Generate one assistant turn from the current transcript, streaming the
-    # filtered prose live. Re-prefills the whole (growing) context each call.
-    private def generate(max_tokens : Int32) : Tuple(String, Array(Int32))
-      generate_from(build_prompt, max_tokens, echo: true)
+    # Generate one assistant turn from the current transcript, streaming the filtered prose live.
+    #
+    # The turn is bounded ONLY by the context window, not by a fixed per-reply token cap. A 27B
+    # reasoning model routinely writes a <think> block of many thousands of tokens before it answers;
+    # a sub-window cap cut it off mid-thought and the turn ended with no answer. The window is the real
+    # budget, and compaction (see chat) keeps room free for the reply and the tool round-trips. A model
+    # that never stops is bounded by the window and by Ctrl-C, not by truncating every good turn.
+    private def generate : Tuple(String, Array(Int32))
+      generate_from(build_prompt, @max_context, echo: true)
     end
 
     # Handle one user input: run the tool loop until the model answers plainly.
-    def chat(input : String, max_tokens : Int32)
+    def chat(input : String)
       @messages << Message.new("user", input)
       @recent_calls.clear
       # One OOM recovery per turn: a second failure after compacting is not a transient.
@@ -2158,7 +2166,7 @@ module AgentDemo
         # cache filled mid-reply, the turn died with "generation failed", and the next turn -- same
         # size, still under the window -- did it again. Compact to 75% to leave room for the reply
         # and a few tool round-trips before the next compaction.
-        if context_tokens + reply_reserve(max_tokens) > @max_context
+        if context_tokens + reply_reserve > @max_context
           removed = compact!((@max_context * 0.75).to_i)
           STDERR.puts "  [agent] context compacted (−#{removed} tokens)" if removed > 0
         end
@@ -2166,7 +2174,7 @@ module AgentDemo
         STDERR.print "\n#{"Agent".colorize(:light_cyan).bold} ❯ "
         STDERR.flush
         begin
-          text, text_ids = generate(max_tokens) # streams the filtered prose inline
+          text, text_ids = generate # streams the filtered prose inline
         rescue ex
           # An allocation failure is recoverable, and losing the turn to it is the wrong answer.
           #
@@ -2377,7 +2385,6 @@ end
 # Entry point
 # ----------------------------------------------------------------------------
 model_dir = ARGV[0]?
-max_tokens = (ARGV[1]? || ENV["SHAINET_AGENT_MAX_TOKENS"]? || "4096").to_i
 
 # Resolve the model path: Ollama name ("qwen3.8:27b"), GGUF file, or directory.
 gguf_mode = false
@@ -2396,7 +2403,7 @@ elsif model_dir && File.file?(model_dir)
 end
 
 unless model_dir && (Dir.exists?(model_dir) || File.file?(model_dir.not_nil!))
-  STDERR.puts "Usage: agent <model | gguf-file | ollama-name> [max_tokens]"
+  STDERR.puts "Usage: agent <model | gguf-file | ollama-name>"
   STDERR.puts "  agent ~/models/Qwen3.8-27B/.q4"
   STDERR.puts "  agent qwen3.8:27b"
   exit 1
@@ -2541,7 +2548,7 @@ at_exit { BAR.uninstall }
 # where the loop calls refresh as well.
 Signal::WINCH.trap { BAR.refresh }
 # Text typed during a turn but never sent comes back pre-filled at the next prompt.
-LibRLHook.rl_startup_hook = ->{ AgentDemo.readline_prefill }
+LibRLHook.rl_startup_hook = -> { AgentDemo.readline_prefill }
 at_exit { AgentDemo.disable_bracketed_paste }
 at_exit { AgentDemo.save_history }
 agent.status_bar = BAR
@@ -2636,7 +2643,7 @@ loop do
   AgentDemo.generating = true
   AgentDemo.steer_mode_on
   begin
-    agent.chat(input, max_tokens)
+    agent.chat(input)
   ensure
     AgentDemo.steer_mode_off
     AgentDemo.generating = false

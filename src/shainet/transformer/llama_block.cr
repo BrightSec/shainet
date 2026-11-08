@@ -183,6 +183,30 @@ module SHAInet
       # append kernel before they ever become visible to attention.
     end
 
+    # Positions currently held in the KV cache.
+    def cached_length : Int32
+      cached_positions
+    end
+
+    # Drop every cached position at or after `positions`, so the next forward continues from there.
+    #
+    # The device cache is append-only at @cache_len, so moving @cache_len back is the whole rewind:
+    # the stale positions past it are overwritten before attention can see them, the same guarantee
+    # clear_cache! relies on. The host mirror, when it is the authoritative copy, is cut to match.
+    def truncate_cache!(positions : Int32)
+      have = cached_positions
+      unless 0 <= positions <= have
+        raise ArgumentError.new("cannot truncate a #{have}-position KV cache to #{positions}")
+      end
+      unless @host_kv_stale
+        want = positions * @head_dim
+        {@k_cache, @v_cache}.each do |cache|
+          cache.each { |arr| arr.truncate(0, want) if arr.size > want }
+        end
+      end
+      @cache_len = positions
+    end
+
     def finalize
       # Only free the per-instance KV cache; the attention scratch is class-level
       # and shared across all blocks, so it must not be freed per instance.

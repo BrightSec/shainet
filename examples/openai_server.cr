@@ -1,5 +1,7 @@
 require "../src/shainet"
 require "./tool_protocol"
+require "./openai_responses"
+require "./qwen_thinking"
 require "http/server"
 require "json"
 require "random/secure"
@@ -11,14 +13,16 @@ require "random/secure"
 #
 #   GET  /v1/models               — list the loaded model
 #   POST /v1/chat/completions      — chat completion (streaming + non-streaming)
+#   POST /v1/responses             — Responses API, stateless (streaming + non-streaming)
 #   GET  /health                   — liveness probe
 #
 # Usage:
 #   crystal run examples/openai_server.cr -Denable_cuda -- /path/to/model-dir [port] [host]
-#   SHAINET_Q4=1 SHAINET_MOE_OFFLOAD=1 crystal run examples/openai_server.cr -Denable_cuda -- /models/Qwen3-Coder-30B-A3B-Instruct
+#   crystal run examples/openai_server.cr -Denable_cuda -- /models/Qwen3-Coder-30B-A3B-Instruct
 #
-# Quantization / offload are controlled by the same env vars as llama_chat.cr
-# (SHAINET_FP32, SHAINET_Q4, SHAINET_MOE_OFFLOAD, SHAINET_EXPERT_CACHE_MB).
+# Load-time defaults match examples/agent.cr: Q4, MoE offload on, fp8 KV cache, expert cache sized to
+# leave room for the context. Opt out with SHAINET_Q8=1, SHAINET_MOE_OFFLOAD=0, SHAINET_KV_DTYPE=f16,
+# SHAINET_EXPERT_CACHE_MB=<mb>, or SHAINET_FP32=1.
 #
 # SECURITY: this is an example server with NO authentication by default and it
 # binds to 127.0.0.1 (localhost only). Do not expose it to an untrusted network.
@@ -38,12 +42,18 @@ module OpenAIServer
     getter id : String
     getter type : String = "function"
     getter function : FunctionRef
+
+    def initialize(@id : String, @function : FunctionRef)
+    end
   end
 
   struct FunctionRef
     include JSON::Serializable
     getter name : String
     getter arguments : String = "{}"
+
+    def initialize(@name : String, @arguments : String = "{}")
+    end
   end
 
   struct ChatMessage
@@ -55,6 +65,31 @@ module OpenAIServer
     getter content : String?
     getter tool_calls : Array(ToolCallRef)?
     getter tool_call_id : String?
+    # An assistant turn's reasoning, when the client echoes it back (both names are in use; see
+    # chat_completion_json). Qwen3.8 keeps reasoning in history by default (preserve_thinking).
+    getter reasoning_content : String?
+    getter reasoning : String?
+
+    def initialize(@role : String, @content : String? = nil,
+                   @tool_calls : Array(ToolCallRef)? = nil, @tool_call_id : String? = nil,
+                   @reasoning_content : String? = nil)
+    end
+
+    def reasoning_text : String
+      (@reasoning_content || @reasoning || "").strip
+    end
+  end
+
+  # Sampling settings for one request.
+  record Sampling, temperature : Float64, top_p : Float64, top_k : Int32,
+    presence : Float64, frequency : Float64
+
+  # Chat messages for a /v1/responses request (see openai_responses.cr).
+  def chat_messages(msgs : Array(OpenAIResponses::InputMessage)) : Array(ChatMessage)
+    msgs.map do |m|
+      calls = m.calls.empty? ? nil : m.calls.map { |c| ToolCallRef.new(c.call_id, FunctionRef.new(c.name, c.arguments)) }
+      ChatMessage.new(m.role, m.content, calls, m.tool_call_id, m.reasoning)
+    end
   end
 
   struct ToolDef
@@ -77,10 +112,17 @@ module OpenAIServer
     getter? stream : Bool = false
     getter temperature : Float64?
     getter top_p : Float64?
+    # OpenAI deprecated max_tokens for max_completion_tokens; both are accepted, the new name first.
     getter max_tokens : Int32?
+    getter max_completion_tokens : Int32?
     getter seed : Int64?
     getter frequency_penalty : Float64?
     getter presence_penalty : Float64?
+    # Not in OpenAI's schema, but vLLM and SGLang accept it and Qwen's own examples send it.
+    getter top_k : Int32?
+    getter reasoning_effort : String?
+    # {"enable_thinking": false} turns thinking off, as with vLLM and SGLang.
+    getter chat_template_kwargs : JSON::Any?
     # `stop` may be a single string or an array of strings in the OpenAI API.
     getter stop : JSON::Any?
     getter tools : Array(ToolDef)?
@@ -98,6 +140,10 @@ module OpenAIServer
       (@tools || [] of ToolDef).map do |t|
         ToolProtocol::FunctionDef.new(t.function.name, t.function.description, t.function.parameters)
       end
+    end
+
+    def enable_thinking : Bool?
+      @chat_template_kwargs.try { |k| k.as_h? ? k["enable_thinking"]?.try(&.as_bool?) : nil }
     end
   end
 
@@ -168,25 +214,34 @@ module OpenAIServer
     #     conversation it sees is the one it wrote rather than a gap where its call used to be.
     #   * a TOOL result, which OpenAI sends as its own role with a tool_call_id. This model was trained
     #     on <tool_response> inside a USER turn, so that is what it gets.
+    #
+    # Each entry is {role, head, body}. `head` is tokenized on its own, ahead of `body`: an assistant
+    # turn's "<think>\n" is encoded exactly as the generation prompt encoded it, so the previous
+    # request's prompt stays a token prefix of this one and the cached prefill can be reused.
+    #
+    # Thinking follows Qwen3.8's chat template: the reasoning-effort line opens the system message,
+    # and assistant turns keep their reasoning in a <think> block (preserve_thinking, the template
+    # default; an empty block when the client did not echo the reasoning back).
     private def render_messages(messages : Array(ChatMessage),
                                 tools : Array(ToolProtocol::FunctionDef),
-                                forced_tool : String?) : Array(Tuple(String, String))
-      result = [] of Tuple(String, String)
+                                forced_tool : String?,
+                                mode : QwenThinking::Mode) : Array(Tuple(String, String, String))
+      result = [] of Tuple(String, String, String)
       tool_block = tools.empty? ? "" : ToolProtocol.render_tools(tools)
       tool_block += ToolProtocol.render_forced_choice(forced_tool) if forced_tool && !tools.empty?
-      injected = tool_block.empty?
+
+      # One system message: effort line, tool declarations, then the client's own system text.
+      client_system = messages.select { |m| m.role == "system" }.map { |m| m.content || "" }
+      system = [tool_block, client_system.join("\n\n")].reject(&.empty?).join("\n\n")
+      system = QwenThinking.with_instruction(system, mode)
+      result << {"system", "", system} unless system.empty?
 
       messages.each do |m|
         case m.role
         when "system"
-          body = m.content || ""
-          unless injected
-            body = "#{body}\n\n#{tool_block}"
-            injected = true
-          end
-          result << {"system", body}
+          next
         when "tool"
-          result << {"user", "<tool_response>\n#{m.content || ""}\n</tool_response>"}
+          result << {"user", "", "<tool_response>\n#{m.content || ""}\n</tool_response>"}
         when "assistant"
           body = m.content || ""
           if calls = m.tool_calls
@@ -195,14 +250,15 @@ module OpenAIServer
               body += render_call_xml(c)
             end
           end
-          result << {"assistant", body}
+          if mode.enabled
+            result << {"assistant", "<think>\n", "#{m.reasoning_text}\n</think>\n\n#{body}"}
+          else
+            result << {"assistant", "", body}
+          end
         else
-          result << {m.role, m.content || ""}
+          result << {m.role, "", m.content || ""}
         end
       end
-
-      # No system message to attach the declarations to: prepend one rather than dropping the tools.
-      result.unshift({"system", tool_block}) unless injected
       result
     end
 
@@ -227,17 +283,19 @@ module OpenAIServer
     # concatenation), ending with the assistant generation prompt.
     def build_prompt(messages : Array(ChatMessage),
                      tools : Array(ToolProtocol::FunctionDef) = [] of ToolProtocol::FunctionDef,
-                     forced_tool : String? = nil) : Array(Int32)
+                     forced_tool : String? = nil,
+                     mode : QwenThinking::Mode = QwenThinking.mode(nil)) : Array(Int32)
       ids = [] of Int32
       im_start, im_end = @im_start, @im_end
       bos, start_hdr, end_hdr, eot = @bos, @start_hdr, @end_hdr, @eot
-      rendered = render_messages(messages, tools, forced_tool)
+      rendered = render_messages(messages, tools, forced_tool, mode)
 
       if im_start && im_end
-        rendered.each do |role, content|
+        rendered.each do |role, head, content|
           ids << im_start
           ids.concat(@tok.encode(role))
           ids.concat(@nl)
+          ids.concat(@tok.encode(head)) unless head.empty?
           ids.concat(@tok.encode(content))
           ids << im_end
           ids.concat(@nl)
@@ -245,14 +303,16 @@ module OpenAIServer
         ids << im_start
         ids.concat(@tok.encode("assistant"))
         ids.concat(@nl)
+        # The template's generation prompt: open the thought, or close an empty one to skip it.
+        ids.concat(@tok.encode(mode.enabled ? "<think>\n" : QwenThinking::OFF_PRIMER))
       elsif bos && start_hdr && end_hdr && eot
         ids << bos
-        rendered.each do |role, content|
+        rendered.each do |role, head, content|
           ids << start_hdr
           ids.concat(@tok.encode(role))
           ids << end_hdr
           ids.concat(@nl2)
-          ids.concat(@tok.encode(content))
+          ids.concat(@tok.encode(head + content))
           ids << eot
         end
         ids << start_hdr
@@ -278,37 +338,43 @@ module OpenAIServer
     # already sent its 200 and its SSE headers by the time generation starts -- at that point a 400 is
     # no longer possible and the client would get a stream that simply dies. Re-tokenizing the prompt
     # to answer this costs a fraction of one token's generation.
-    def context_error(messages : Array(ChatMessage), max_tokens : Int32) : String?
-      needed = build_prompt(messages).size
-      return if needed + max_tokens <= @max_context
-      "This model's maximum context length is #{@max_context} tokens, but the request needs " \
-      "#{needed} prompt tokens + #{max_tokens} completion tokens (#{needed + max_tokens}). " \
-      "Shorten the messages or lower max_tokens."
+    def context_error(messages : Array(ChatMessage), max_tokens : Int32?,
+                      mode : QwenThinking::Mode = QwenThinking.mode(nil)) : String?
+      OpenAIServer.context_message(@max_context, build_prompt(messages, mode: mode).size, max_tokens)
     end
 
-    def generate(messages : Array(ChatMessage), max_tokens : Int32,
-                 temperature : Float64, top_k : Int32, repetition_penalty : Float64,
+    # `max_tokens` is the OpenAI limit (max_completion_tokens / max_output_tokens): an upper bound on
+    # EVERY generated token, reasoning included. nil means the client set no limit, and generation may
+    # use whatever room the context window has left.
+    def generate(messages : Array(ChatMessage), max_tokens : Int32?,
+                 sampling : Sampling, mode : QwenThinking::Mode,
                  stop_strings : Array(String), seed : Int64?,
                  tools : Array(ToolProtocol::FunctionDef) = [] of ToolProtocol::FunctionDef,
                  forced_tool : String? = nil, &block : String ->) : Generation
       @mutex.synchronize do
-        @net.clear_cache!
-        prompt_ids = build_prompt(messages, tools, forced_tool)
+        prompt_ids = build_prompt(messages, tools, forced_tool, mode)
         # Refuse a prompt that cannot fit rather than dying on it.
         #
         # The agent controls its own prompt and compacts when it grows; a server is handed whatever a
         # client sends. Without this, one oversized request exhausts VRAM and takes the process down,
         # losing every other client's session with it. OpenAI's own API answers this case with an
         # error, so a client already knows how to handle it.
-        if prompt_ids.size + max_tokens > @max_context
-          raise ContextLengthError.new(
-            "This model's maximum context length is #{@max_context} tokens, but the request needs " \
-            "#{prompt_ids.size} prompt tokens + #{max_tokens} completion tokens " \
-            "(#{prompt_ids.size + max_tokens}). Shorten the messages or lower max_tokens.")
+        if msg = OpenAIServer.context_message(@max_context, prompt_ids.size, max_tokens)
+          raise ContextLengthError.new(msg)
+        end
+        # Never decode past the KV budget, whatever the limit.
+        room = @max_context - prompt_ids.size
+        limit = Math.min(max_tokens || Int32::MAX, room)
+        if (asked = max_tokens) && asked > room
+          Log.info do
+            "token limit #{asked} capped to #{room}: #{prompt_ids.size} prompt tokens leave " \
+            "#{room} of the #{@max_context}-token context"
+          end
         end
         rng = seed ? Random.new(seed) : Random.new
-        sampler = SHAInet::Sampler.new(temperature: temperature, top_k: top_k,
-          repetition_penalty: repetition_penalty, rng: rng)
+        sampler = SHAInet::Sampler.new(temperature: sampling.temperature, top_k: sampling.top_k,
+          top_p: sampling.top_p, rng: rng)
+        counts = {} of Int32 => Int32
 
         # Prefill is timed and logged separately from decode because they fail differently and are
         # bound by different things. A slow prefill means the prompt is large or the cache missed; slow
@@ -316,56 +382,36 @@ module OpenAIServer
         # which of those is happening, and on this model a host-resident layer costs about a second per
         # TOKEN, so the difference is the whole diagnosis.
         pf = Time.instant
-        logits = @net.run(prompt_ids, stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
+        reused = 0
+        begin
+          reused = rewind_to_prefix(prompt_ids)
+          tail = prompt_ids[reused..]
+          logits = @net.run(tail, stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
+          # Saved BEFORE generating, at exactly the prompt: the next request in this conversation
+          # starts with this prompt and can rewind to here.
+          @net.save_cache!(prompt_ids.size)
+          @saved_prompt = prompt_ids
+        rescue ex
+          forget_cache!
+          raise ex
+        end
         pf_secs = (Time.instant - pf).total_seconds
+        filled = prompt_ids.size - reused
         Log.info do
-          "prefill #{prompt_ids.size} tok in #{pf_secs.round(2)}s " \
-          "(#{(prompt_ids.size / (pf_secs > 0 ? pf_secs : 1.0)).round(0).to_i} tok/s)"
+          "prefill #{filled} tok#{reused > 0 ? " (reused #{reused} cached)" : ""} in #{pf_secs.round(2)}s " \
+          "(#{(filled / (pf_secs > 0 ? pf_secs : 1.0)).round(0).to_i} tok/s)"
         end
         dec = Time.instant
         generated = [] of Int32
-        text = ""
+        # The generation prompt already opened the thought, so the text starts inside it.
+        text = mode.enabled && @im_start ? "<think>\n" : ""
         emitted = 0
         finish = "length"
 
-        # The caller's max_tokens caps the ANSWER, not the thinking that precedes it.
-        #
-        # Taken literally it does neither, it just stops generation -- and on a reasoning model that
-        # reliably produces the worst possible outcome. Observed live: a client asking for 512 tokens got
-        # three consecutive turns where all 512 went inside <think>, the cap landed mid-thought, and the
-        # reply came back structurally valid and empty. The client could not act on it, retried, and hit
-        # the same wall at 145 seconds a round.
-        #
-        # OpenAI's own answer to this is not to ignore the parameter but to refuse a value too small for
-        # a reasoning request -- smaller values are REJECTED rather than silently returning nothing. We
-        # cannot reject usefully here (the caller cannot know the thinking length in advance, and
-        # bright-agent's 512 is hardcoded), so the cap is honoured where it is meaningful and suspended
-        # where it is destructive: while a thought is still open, generation continues.
-        #
-        # The ceiling is what the context allows, not infinity, so a model that never closes a thought
-        # stops at a real boundary instead of running until something else breaks.
-        # The extension is BOUNDED, and not by the context. Letting it run to the context limit sounded
-        # principled and is not: with a 9K prompt in a 64K window that is 56,000 tokens, and at ~110
-        # ms/token this model would sit in one request for over an hour before giving up. A fixed grace
-        # is both predictable and small enough to fail fast -- 2048 extra tokens is under four minutes.
-        grace = (ENV["SHAINET_REASONING_GRACE"]? || "2048").to_i
-        room = @max_context - prompt_ids.size - 8
-        ceiling = Math.min(Math.max(max_tokens, max_tokens + grace), Math.max(max_tokens, room))
-        extended = false
-
-        while generated.size < ceiling
-          if generated.size >= max_tokens
-            # At the cap. Stop unless a thought is still open, in which case the answer has not been
-            # written yet and stopping here guarantees an empty reply.
-            break unless ToolProtocol.truncated_think?(text)
-            unless extended
-              extended = true
-              Log.info do
-                "still inside <think> at max_tokens=#{max_tokens}; continuing to #{ceiling} so the " \
-                "answer has room (reasoning does not count against the caller's budget)"
-              end
-            end
-          end
+        # The limit counts reasoning, as OpenAI's max_completion_tokens and max_output_tokens do. A
+        # reply whose reasoning used the whole limit ends with finish_reason "length" (Responses:
+        # status "incomplete"), which is what OpenAI returns and what clients already handle.
+        while generated.size < limit
           # Let other fibers run.
           #
           # Crystal's HTTP server is fiber-based, and this loop is CPU/GPU bound with no yield point of
@@ -379,28 +425,43 @@ module OpenAIServer
           # every other fiber, including the ones the runtime needs.
           Fiber.yield
           last = logits.rows - 1
-          sampler.apply_repetition_penalty!(logits, generated, window: 64, row: last)
+          sampler.apply_presence_frequency!(logits, counts, sampling.presence, sampling.frequency, row: last)
           id = sampler.sample(logits, last)
           break if id < 0 || @stop_ids.includes?(id) ? (finish = "stop"; true) : false
           break unless logits[last, id].finite?
 
           generated << id
+          counts[id] = (counts[id]? || 0) + 1
           text += @tok.decode([id])
+
+          # Offsets here are BYTES. A character split across byte-fallback tokens (an emoji, CJK) is
+          # invalid UTF-8 until its last byte arrives, and joining the halves makes the CHARACTER count
+          # shrink -- which made a char offset point past the end and raised IndexError mid-reply.
+          # An incomplete character is held back until it completes.
 
           # Honor user-supplied stop sequences: cut at the first occurrence.
           if si = first_stop_index(text, stop_strings)
-            piece = text[emitted...si]
+            piece = text.byte_slice(emitted, si - emitted).scrub
             block.call(piece) unless piece.empty?
-            text = text[0...si]
+            text = text.byte_slice(0, si)
             finish = "stop"
             break
           end
 
-          block.call(text[emitted..])
-          emitted = text.size
+          piece = text.byte_slice(emitted)
+          if piece.valid_encoding?
+            block.call(piece) unless piece.empty?
+            emitted = text.bytesize
+          end
 
           logits = @net.run([id], stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
         end
+        # A character still incomplete when generation stopped: send what there is, scrubbed.
+        if emitted < text.bytesize
+          rest = text.byte_slice(emitted).scrub
+          block.call(rest) unless rest.empty?
+        end
+        text = text.scrub
 
         # Extract any tool calls the model emitted, and report the finish reason OpenAI clients branch
         # on. A client decides whether to run tools by the presence of tool_calls, so a call the parser
@@ -429,9 +490,9 @@ module OpenAIServer
         if finish == "length" && answer.empty? && calls.empty? && !reasoning.empty?
           Log.warn do
             "reply is EMPTY: all #{generated.size} tokens went to reasoning (#{reasoning.size} chars) " \
-            "and the turn hit max_tokens before any answer or tool call. The caller will see " \
-            "content=\"\" and is likely to retry into the same wall -- raise max_tokens above " \
-            "#{generated.size} for this prompt."
+            "and the turn hit the token limit before any answer or tool call. The caller sees " \
+            "content=\"\" with finish_reason=length -- raise max_completion_tokens / " \
+            "max_output_tokens above #{generated.size} for this prompt, or omit it."
           end
         elsif calls.empty? && ToolProtocol.truncated?(text)
           # A DIFFERENT failure with the same symptom. The model opened <tool_call> and never closed it,
@@ -440,18 +501,48 @@ module OpenAIServer
           # long", and conflating the two sends anyone debugging in the wrong direction.
           Log.warn do
             "TRUNCATED tool call: a <tool_call> was opened and never closed (finish=#{finish}), so no " \
-            "call could be parsed and the caller will read this as a final answer. Raise max_tokens."
+            "call could be parsed and the caller will read this as a final answer. Raise the token limit."
           end
         end
         Generation.new(answer, prompt_ids.size, generated.size, finish, calls, tools, reasoning)
       end
     end
 
+    # Prompt the cache was saved at (see Network#save_cache!), or nil.
+    @saved_prompt : Array(Int32)? = nil
+
+    # Rewind the cache to the previous request's prompt when this prompt extends it, and return how
+    # many tokens are reused; otherwise clear it and return 0.
+    #
+    # Clients resend the whole conversation each turn, so turn N+1's prompt starts with turn N's
+    # prompt. The cache holds more than that -- the reply as generated, <think> included -- while the
+    # client echoes the reply back without its reasoning, so the cache itself is never a prefix of
+    # the new prompt. The saved point at the end of the previous PROMPT is: rewinding to it keeps the
+    # whole earlier history and prefills only the new tail (the echoed reply and the tool results).
+    # A different conversation, an edited history, or an identical prompt falls back to a full
+    # prefill, which is the old behaviour.
+    private def rewind_to_prefix(prompt : Array(Int32)) : Int32
+      if (saved = @saved_prompt) && saved.size < prompt.size && prompt[0, saved.size] == saved
+        if (pos = @net.restore_cache!) && pos == saved.size
+          return pos
+        end
+      end
+      forget_cache!
+      0
+    end
+
+    private def forget_cache!
+      @saved_prompt = nil
+      @net.drop_saved_cache!
+      @net.clear_cache!
+    end
+
+    # Byte offset of the earliest stop sequence in `text`, or nil.
     private def first_stop_index(text : String, stops : Array(String)) : Int32?
       idx = nil
       stops.each do |s|
         next if s.empty?
-        if i = text.index(s)
+        if i = text.byte_index(s)
           idx = idx ? Math.min(idx, i) : i
         end
       end
@@ -460,6 +551,46 @@ module OpenAIServer
   end
 
   # ---- response helpers -------------------------------------------------------
+
+  # A request's sampling: the client's values where given, else Qwen3.8's recommended thinking-mode
+  # values (temperature 1.0, top_p 0.95, top_k 20, presence/frequency penalty 0).
+  def sampling(temperature : Float64?, top_p : Float64?, top_k : Int32?,
+               presence : Float64?, frequency : Float64?) : Sampling
+    t = temperature || QwenThinking::TEMPERATURE
+    t = 0.01 if t <= 0.0 # the sampler requires > 0; 0.01 is effectively greedy
+    p = top_p || QwenThinking::TOP_P
+    p = 1.0 unless 0.0 < p <= 1.0
+    k = top_k || QwenThinking::TOP_K
+    k = QwenThinking::TOP_K if k < 1
+    Sampling.new(t, p, k, presence || 0.0, frequency || 0.0)
+  end
+
+  # The thinking mode for a request, or the error message for an unsupported effort.
+  def thinking_mode(effort : String?, enable_thinking : Bool?) : QwenThinking::Mode | String
+    QwenThinking.mode(effort, enable_thinking)
+  rescue ex : QwenThinking::EffortError
+    ex.message.to_s
+  end
+
+  def describe(s : Sampling, mode : QwenThinking::Mode) : String
+    effort = !mode.enabled ? "none" : (mode.instruction == QwenThinking::LOW ? "low" : (mode.instruction ? "xhigh" : "medium"))
+    "temp=#{s.temperature.round(2)} top_p=#{s.top_p} top_k=#{s.top_k}" \
+    "#{s.presence != 0 ? " presence=#{s.presence}" : ""}#{s.frequency != 0 ? " frequency=#{s.frequency}" : ""} " \
+    "effort=#{effort}"
+  end
+
+  # Error text when the prompt cannot fit the context, else nil.
+  #
+  # Only the prompt has to fit. A token limit larger than the room left is capped to that room at
+  # generation time rather than rejected, as llama.cpp's server and Ollama do. OpenAI rejects it, but
+  # its windows are hundreds of thousands of tokens; on a 64K local window, clients sized for those
+  # (bright-agent asks for 32768) would otherwise be refused once the history passed 32K, with room
+  # still left to answer.
+  def context_message(max_context : Int32, prompt : Int32, max_tokens : Int32?) : String?
+    return if prompt < max_context
+    "This model's maximum context length is #{max_context} tokens, but the prompt alone is " \
+    "#{prompt} tokens. Shorten the messages."
+  end
 
   def completion_id : String
     "chatcmpl-#{Random::Secure.hex(12)}"
@@ -648,6 +779,10 @@ host = ARGV[2]? || "127.0.0.1"
 # does not support the format. Same resolution, same tokenizer split, so the two entry points cannot
 # drift on which models they accept.
 gguf_mode = false
+# The name clients will ask for. For an Ollama model this must be the Ollama name, not the resolved
+# blob path: the blob is named by its digest, and advertising "sha256-..." in /v1/models made clients
+# that validate their configured model against that list (bright-agent) refuse to start.
+ollama_name : String? = nil
 if model_dir && SHAInet::OllamaResolve.ollama_name?(model_dir)
   resolved = SHAInet::OllamaResolve.resolve(model_dir)
   unless resolved
@@ -655,6 +790,7 @@ if model_dir && SHAInet::OllamaResolve.ollama_name?(model_dir)
     exit 1
   end
   STDERR.puts "Resolved Ollama '#{model_dir}' -> #{resolved}"
+  ollama_name = model_dir
   model_dir = resolved
   gguf_mode = true
 elsif model_dir && File.file?(model_dir)
@@ -673,9 +809,16 @@ end
 STDERR.puts "Loading model from #{model_dir}..."
 t = Time.instant
 quantize = SHAInet::CUDA.fully_available? && !ENV["SHAINET_FP32"]?
-bits = ENV["SHAINET_Q4"]? ? 4 : 8
+# Same load-time defaults as the agent: Q4 and MoE offload are what a large model needs to fit on one
+# consumer GPU, so they are on unless opted out (SHAINET_Q8=1, SHAINET_MOE_OFFLOAD=0). SHAINET_Q4 is
+# still accepted but is now the default.
+ENV["SHAINET_MOE_OFFLOAD"] = "1" unless ENV.has_key?("SHAINET_MOE_OFFLOAD")
+bits = ENV.fetch("SHAINET_Q8", "0") == "1" ? 8 : 4
 mode = ENV["SHAINET_FP32"]? ? "fp32" : "Q#{bits}"
 offload = ENV.fetch("SHAINET_MOE_OFFLOAD", "0") == "1"
+# fp8 KV cache, as in the agent: at 64K the cache is most of the VRAM reserve, and fp8 halves it versus
+# f16. SHAINET_KV_DTYPE=f16 opts out.
+ENV["SHAINET_KV_DTYPE"] ||= "fp8"
 STDERR.puts "  Mode: #{mode}#{offload ? " (MoE offload)" : ""}"
 
 # Decide the context BEFORE loading, and tell the loader.
@@ -708,15 +851,36 @@ tokenizer =
   end
 STDERR.puts "Loaded in #{(Time.instant - t).total_seconds.round(1)}s (vocab #{tokenizer.vocab.size})"
 
+# Size the MoE expert cache to leave room for the KV cache, as the agent does. Without this the cache
+# defaults to 70% of free VRAM and competes with the context the loader just reserved for.
+# SHAINET_EXPERT_CACHE_MB overrides (0 disables). Dense models have no experts, so nothing is reserved.
+has_moe = net.hidden_layers.any? { |l| l.is_a?(SHAInet::LlamaBlock) && l.as(SHAInet::LlamaBlock).ffn.is_a?(SHAInet::MoEFF) }
+if has_moe && offload && !ENV["SHAINET_EXPERT_CACHE_MB"]? && (info = SHAInet::CUDA.memory_info)
+  kv_reserve = server_context.to_u64 * 128_u64 * 1024_u64
+  reserve = 6_u64 * 1024 * 1024 * 1024 + kv_reserve
+  free = info[:free]
+  budget_mb = free > reserve ? ((free - reserve) // (1024_u64 * 1024_u64)) : 0_u64
+  ENV["SHAINET_EXPERT_CACHE_MB"] = budget_mb.to_s
+  STDERR.puts "  Expert cache budget: #{budget_mb} MB " \
+              "(free #{free // (1024*1024)} MB − 6GB − #{kv_reserve // (1024*1024)} MB for #{server_context} tok context)"
+end
+
 # Clients display and echo this, so drop the .gguf extension rather than advertising a filename.
-model_name = File.basename(model_dir.rstrip("/")).sub(/\.gguf$/i, "")
+model_name = ollama_name || File.basename(model_dir.rstrip("/")).sub(/\.gguf$/i, "")
+# Every id /v1/models lists for this one model. A namespaced Ollama name is also listed without its
+# namespace ("incu6us/qwen3.8-gsq:27b-iq3_s" and "qwen3.8-gsq:27b-iq3_s"), since clients are
+# configured with either form.
+model_ids = [model_name]
+if (n = ollama_name) && n.includes?("/")
+  model_ids << n.split("/").last
+end
 engine = OpenAIServer::Engine.new(net, tokenizer, model_name, server_context)
 
 api_key = ENV["SHAINET_API_KEY"]?
-# Used only when the caller sends no max_tokens. 512 was a text-model default: on a reasoning model the
-# thinking alone routinely exceeds it, so a caller that omits the field was being handed the empty-reply
-# failure by default rather than by its own choice.
-default_max_tokens = (ENV["SHAINET_MAX_TOKENS"]? || "4096").to_i
+# Token limit for a request that sends none. Unset by default, as on OpenAI: generation may then use
+# the room left in the context window. A fixed default cut reasoning models off mid-thought and
+# returned empty replies to clients that never asked for a limit. SHAINET_MAX_TOKENS sets one.
+default_max_tokens = ENV["SHAINET_MAX_TOKENS"]?.try(&.to_i?)
 
 authorized = ->(req : HTTP::Request) : Bool {
   return true unless k = api_key
@@ -752,11 +916,13 @@ server = HTTP::Server.new do |ctx|
           j.field "object", "list"
           j.field "data" do
             j.array do
-              j.object do
-                j.field "id", model_name
-                j.field "object", "model"
-                j.field "created", Time.utc.to_unix
-                j.field "owned_by", "shainet"
+              model_ids.each do |mid|
+                j.object do
+                  j.field "id", mid
+                  j.field "object", "model"
+                  j.field "created", Time.utc.to_unix
+                  j.field "owned_by", "shainet"
+                end
               end
             end
           end
@@ -782,13 +948,18 @@ server = HTTP::Server.new do |ctx|
         next
       end
 
-      max_tokens = request.max_tokens || default_max_tokens
-      temperature = request.temperature || 0.7
-      temperature = 0.01 if temperature <= 0.0 # sampler requires > 0; ~greedy
-      # OpenAI exposes top_p, not top_k; approximate with a fixed top_k and map
-      # frequency/presence penalty onto SHAInet's repetition penalty.
-      top_k = 40
-      rep_pen = 1.0 + (request.frequency_penalty || request.presence_penalty || 0.0).clamp(0.0, 1.0)
+      max_tokens = request.max_completion_tokens || request.max_tokens || default_max_tokens
+      # Defaults are Qwen3.8's recommended thinking-mode sampling; a client's own values win.
+      sampling = OpenAIServer.sampling(request.temperature, request.top_p, request.top_k,
+        request.presence_penalty, request.frequency_penalty)
+      effort_mode = OpenAIServer.thinking_mode(request.reasoning_effort, request.enable_thinking)
+      if effort_mode.is_a?(String)
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json(effort_mode)
+        next
+      end
+      think = effort_mode.as(QwenThinking::Mode)
       stops = OpenAIServer.normalize_stop(request.stop)
       model = request.model || model_name
 
@@ -801,13 +972,14 @@ server = HTTP::Server.new do |ctx|
         roles = request.messages.map(&.role).join(">")
         tool_names = request.tool_defs.map(&.name)
         "#{peer} chat model=#{model} msgs=#{request.messages.size} [#{roles}] " \
-        "max_tokens=#{max_tokens} temp=#{temperature.round(2)}#{request.stream? ? " stream" : ""}" \
+        "max_tokens=#{max_tokens || "none"} #{OpenAIServer.describe(sampling, think)}" \
+        "#{request.stream? ? " stream" : ""}" \
         "#{tool_names.empty? ? "" : " tools=#{tool_names.join(",")}"}" \
         "#{request.forced_tool ? " forced=#{request.forced_tool}" : ""}" \
         "#{stops.empty? ? "" : " stops=#{stops.size}"}"
       end
 
-      if msg = engine.context_error(request.messages, max_tokens)
+      if msg = engine.context_error(request.messages, max_tokens, think)
         res.status = HTTP::Status::BAD_REQUEST
         res.content_type = "application/json"
         res.print OpenAIServer.error_json(msg, "context_length_exceeded")
@@ -827,7 +999,7 @@ server = HTTP::Server.new do |ctx|
         }
         send.call(OpenAIServer.chunk_json(id, model, created, delta_role: "assistant"))
 
-        gen = engine.generate(request.messages, max_tokens, temperature, top_k, rep_pen, stops, request.seed, request.tool_defs, request.forced_tool) do |piece|
+        gen = engine.generate(request.messages, max_tokens, sampling, think, stops, request.seed, request.tool_defs, request.forced_tool) do |piece|
           send.call(OpenAIServer.chunk_json(id, model, created, delta_content: piece))
         end
 
@@ -835,9 +1007,202 @@ server = HTTP::Server.new do |ctx|
         res.print "data: [DONE]\n\n"
         res.flush
       else
-        gen = engine.generate(request.messages, max_tokens, temperature, top_k, rep_pen, stops, request.seed, request.tool_defs, request.forced_tool) { }
+        gen = engine.generate(request.messages, max_tokens, sampling, think, stops, request.seed, request.tool_defs, request.forced_tool) { }
         res.content_type = "application/json"
         res.print OpenAIServer.chat_completion_json(OpenAIServer.completion_id, model, gen)
+      end
+    when {"POST", "/responses"}
+      # Responses API, translated onto the same generation path as chat completions (see
+      # openai_responses.cr). Stateless: the client sends the whole conversation in `input`.
+      body = req.body.try(&.gets_to_end) || ""
+      rq = begin
+        JSON.parse(body)
+      rescue ex : JSON::ParseException
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json("Invalid request body: #{ex.message}")
+        next
+      end
+
+      unless rq.as_h?
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json("Request body must be a JSON object.")
+        next
+      end
+
+      if rq["previous_response_id"]?.try(&.as_s?)
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json("previous_response_id is not supported: this server stores no " \
+                                          "responses. Send the full conversation in 'input'.")
+        next
+      end
+
+      json_format = OpenAIResponses.format_instruction(rq["text"]?)
+      tools_off, forced = OpenAIResponses.tool_choice(rq["tool_choice"]?)
+      tool_defs = tools_off ? [] of ToolProtocol::FunctionDef : OpenAIResponses.tool_defs(rq["tools"]?)
+      messages = begin
+        msgs = OpenAIResponses.parse_input(rq["input"]?, rq["instructions"]?.try(&.as_s?))
+        OpenAIServer.chat_messages(OpenAIResponses.with_system(msgs, json_format))
+      rescue ex : OpenAIResponses::RequestError
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json(ex.message.to_s)
+        next
+      end
+
+      max_tokens = rq["max_output_tokens"]?.try(&.as_i?) || default_max_tokens
+      num = ->(key : String) { rq[key]?.try { |t| t.as_f? || t.as_i?.try(&.to_f) } }
+      sampling = OpenAIServer.sampling(num.call("temperature"), num.call("top_p"),
+        rq["top_k"]?.try(&.as_i?), nil, nil)
+      effort = rq["reasoning"]?.try { |r| r.as_h? ? r["effort"]?.try(&.as_s?) : nil }
+      effort_mode = OpenAIServer.thinking_mode(effort, nil)
+      if effort_mode.is_a?(String)
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json(effort_mode)
+        next
+      end
+      think = effort_mode.as(QwenThinking::Mode)
+      seed = rq["seed"]?.try(&.as_i64?)
+      model = rq["model"]?.try(&.as_s?) || model_name
+      stream = rq["stream"]?.try(&.as_bool?) || false
+
+      OpenAIServer::Log.info do
+        "#{peer} responses model=#{model} msgs=#{messages.size} [#{messages.map(&.role).join(">")}] " \
+        "max_tokens=#{max_tokens || "none"} #{OpenAIServer.describe(sampling, think)}#{stream ? " stream" : ""}" \
+        "#{tool_defs.empty? ? "" : " tools=#{tool_defs.map(&.name).join(",")}"}" \
+        "#{forced ? " forced=#{forced}" : ""}#{json_format ? " json" : ""}"
+      end
+
+      if msg = engine.context_error(messages, max_tokens, think)
+        res.status = HTTP::Status::BAD_REQUEST
+        res.content_type = "application/json"
+        res.print OpenAIServer.error_json(msg, "context_length_exceeded")
+        next
+      end
+
+      rb = OpenAIResponses::Builder.new(model)
+      to_calls = ->(gen : OpenAIServer::Generation) do
+        gen.calls.map do |c|
+          OpenAIResponses::OutputCall.new(c.id, c.name,
+            ToolProtocol.arguments_json(c, gen.tool_defs.find { |d| d.name == c.name }))
+        end
+      end
+      final_text = ->(gen : OpenAIServer::Generation) do
+        json_format && gen.calls.empty? ? OpenAIResponses.strip_code_fence(gen.text) : gen.text
+      end
+
+      if stream
+        res.content_type = "text/event-stream"
+        res.headers["Cache-Control"] = "no-cache"
+        res.headers["Connection"] = "keep-alive"
+        ev = OpenAIResponses::EventWriter.new { |s| res.print s; res.flush }
+        ev.emit("response.created") { |j| j.field("response") { rb.response(j, "in_progress") } }
+        ev.emit("response.in_progress") { |j| j.field("response") { rb.response(j, "in_progress") } }
+
+        answer = OpenAIResponses::AnswerStream.new(->(raw : String) { OpenAIServer.split_reasoning(raw)[1] })
+        started_msg = false
+        send_delta = ->(delta : String) do
+          unless delta.empty?
+            # The message item opens on the first visible text, so a pure tool-call turn has none.
+            unless started_msg
+              started_msg = true
+              ev.emit("response.output_item.added") do |j|
+                j.field "output_index", 0
+                j.field("item") { rb.message_item(j, "", "in_progress") }
+              end
+              ev.emit("response.content_part.added") do |j|
+                j.field "item_id", rb.msg_id
+                j.field "output_index", 0
+                j.field "content_index", 0
+                j.field("part") { rb.text_part(j, "") }
+              end
+            end
+            ev.emit("response.output_text.delta") do |j|
+              j.field "item_id", rb.msg_id
+              j.field "output_index", 0
+              j.field "content_index", 0
+              j.field "delta", delta
+            end
+          end
+          nil
+        end
+
+        gen = engine.generate(messages, max_tokens, sampling, think, [] of String, seed, tool_defs, forced) do |piece|
+          # A JSON answer is sent whole at the end, after its code fence (if any) is removed.
+          send_delta.call(answer.feed(piece)) unless json_format
+        end
+
+        text = final_text.call(gen)
+        send_delta.call(answer.advance(text))
+        index = 0
+        if started_msg
+          ev.emit("response.output_text.done") do |j|
+            j.field "item_id", rb.msg_id
+            j.field "output_index", 0
+            j.field "content_index", 0
+            j.field "text", text
+          end
+          ev.emit("response.content_part.done") do |j|
+            j.field "item_id", rb.msg_id
+            j.field "output_index", 0
+            j.field "content_index", 0
+            j.field("part") { rb.text_part(j, text) }
+          end
+          ev.emit("response.output_item.done") do |j|
+            j.field "output_index", 0
+            j.field("item") { rb.message_item(j, text, "completed") }
+          end
+          index = 1
+        end
+        calls = to_calls.call(gen)
+        calls.each do |c|
+          ev.emit("response.output_item.added") do |j|
+            j.field "output_index", index
+            j.field("item") { rb.call_item(j, c, "in_progress", "") }
+          end
+          ev.emit("response.function_call_arguments.delta") do |j|
+            j.field "item_id", rb.fc_id(c)
+            j.field "output_index", index
+            j.field "delta", c.arguments
+          end
+          ev.emit("response.function_call_arguments.done") do |j|
+            j.field "item_id", rb.fc_id(c)
+            j.field "output_index", index
+            j.field "arguments", c.arguments
+          end
+          ev.emit("response.output_item.done") do |j|
+            j.field "output_index", index
+            j.field("item") { rb.call_item(j, c, "completed") }
+          end
+          index += 1
+        end
+        unless gen.reasoning.empty?
+          ev.emit("response.output_item.added") do |j|
+            j.field "output_index", index
+            j.field("item") { rb.reasoning_item(j, gen.reasoning) }
+          end
+          ev.emit("response.output_item.done") do |j|
+            j.field "output_index", index
+            j.field("item") { rb.reasoning_item(j, gen.reasoning) }
+          end
+        end
+        incomplete = gen.finish_reason == "length"
+        ev.emit(incomplete ? "response.incomplete" : "response.completed") do |j|
+          j.field("response") do
+            rb.response(j, incomplete ? "incomplete" : "completed", text, gen.reasoning, calls,
+              {gen.prompt_tokens, gen.completion_tokens}, incomplete)
+          end
+        end
+      else
+        gen = engine.generate(messages, max_tokens, sampling, think, [] of String, seed, tool_defs, forced) { }
+        incomplete = gen.finish_reason == "length"
+        res.content_type = "application/json"
+        res.print rb.response_json(status: incomplete ? "incomplete" : "completed", text: final_text.call(gen),
+          reasoning: gen.reasoning, calls: to_calls.call(gen),
+          usage: {gen.prompt_tokens, gen.completion_tokens}, incomplete: incomplete)
       end
     else
       res.status = HTTP::Status::NOT_FOUND
@@ -859,7 +1224,7 @@ end
 
 address = server.bind_tcp(host, port)
 STDERR.puts "OpenAI-compatible API on http://#{address} (model: #{model_name})"
-STDERR.puts "  POST /v1/chat/completions   GET /v1/models   GET /health"
+STDERR.puts "  POST /v1/chat/completions   POST /v1/responses   GET /v1/models   GET /health"
 STDERR.puts "  tools: OpenAI function calling (tools / tool_choice / role:\"tool\")"
 STDERR.puts "  auth: #{api_key ? "Bearer token required (SHAINET_API_KEY)" : "none (localhost only)"}"
 server.listen
