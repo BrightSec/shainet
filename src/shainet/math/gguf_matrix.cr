@@ -369,7 +369,7 @@ module SHAInet
     # aims at two full waves instead (19 row tiles = 2432 rows there), capped by scratch size.
     # Measured at 17.7K tokens: 1024 rows 673 tok/s, 1152 683, 2432 716, 4864 693.
     # SHAINET_MMQ_SLICE_ROWS forces a fixed size.
-    MMQ_SLICE_ROWS = ENV["SHAINET_MMQ_SLICE_ROWS"]?.try(&.to_i?)
+    MMQ_SLICE_ROWS  = ENV["SHAINET_MMQ_SLICE_ROWS"]?.try(&.to_i?)
     MMQ_SLICE_BYTES = 48_i64 * 1024 * 1024
 
     MMQ_TYPES = {GGUF::GGMLType::Q4_K, GGUF::GGMLType::IQ4_XS, GGUF::GGMLType::IQ3_S, GGUF::GGMLType::IQ3_XXS,
@@ -492,7 +492,7 @@ module SHAInet
       return false unless mmq_buffers(m, k)
       return false unless CUDA.mmq_quantize_swiglu(gate.device_ptr.not_nil!, up.device_ptr.not_nil!,
                             @@mq_x, @@mq_xs, @@mq_xsum, m, k)
-      @@shared_ready = false   # the scratch now holds this input, not the shared one
+      @@shared_ready = false # the scratch now holds this input, not the shared one
       mmq_run(m, k, result)
     end
 

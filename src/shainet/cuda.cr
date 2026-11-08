@@ -331,9 +331,9 @@ module SHAInet
         pointerof(beta), c, ldc)
     end
 
-    CUDA_R_16F         =  2
-    CUDA_R_32F         =  0
-    CUBLAS_COMPUTE_32F = 68
+    CUDA_R_16F          =  2
+    CUDA_R_32F          =  0
+    CUBLAS_COMPUTE_32F  = 68
     CUBLAS_GEMM_DEFAULT = -1
 
     # gemm_tn with half A and B and an fp32 C, accumulated in fp32 on tensor cores. Same layout

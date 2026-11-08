@@ -181,7 +181,7 @@ module AgentDemo
   class Markdown
     property col0 : Bool
 
-    def initialize(@io : IO, @width : Proc(Int32) = ->{ 100 }, @color : Bool = Colorize.enabled?,
+    def initialize(@io : IO, @width : Proc(Int32) = -> { 100 }, @color : Bool = Colorize.enabled?,
                    @col0 : Bool = true)
       @state = :start
       @lbuf = ""
@@ -621,10 +621,10 @@ module AgentDemo
   # Capitalized names. Per line and stateless (a multi-line string or block comment is only colored
   # on its first line) -- enough to make code readable at a glance, which is the job here.
   module Highlight
-    HASH_COMMENT  = Set{"crystal", "cr", "ruby", "rb", "python", "py", "sh", "bash", "shell", "zsh", "console",
-                        "yaml", "yml", "toml", "perl", "r", "make", "makefile", "dockerfile", "nim", "ini", "conf"}
-    DASH_COMMENT  = Set{"sql", "lua", "haskell", "hs"}
-    KEYWORDS      = Set.new(%w(def end if else elsif elif unless while until for in do return class module struct
+    HASH_COMMENT = Set{"crystal", "cr", "ruby", "rb", "python", "py", "sh", "bash", "shell", "zsh", "console",
+                       "yaml", "yml", "toml", "perl", "r", "make", "makefile", "dockerfile", "nim", "ini", "conf"}
+    DASH_COMMENT = Set{"sql", "lua", "haskell", "hs"}
+    KEYWORDS     = Set.new(%w(def end if else elsif elif unless while until for in do return class module struct
       enum lib fun macro require include extend private protected public self super nil true false and or not
       then case when begin rescue ensure raise yield lambda proc import from as with try except finally pass
       break continue let const var function new delete typeof instanceof async await export default interface

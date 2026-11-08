@@ -17,9 +17,9 @@ module QwenThinking
   # The primer that disables thinking for one generation, appended after "<|im_start|>assistant\n".
   OFF_PRIMER = "<think>\n\n</think>\n\n"
 
-  TEMPERATURE = 1.0
+  TEMPERATURE =  1.0
   TOP_P       = 0.95
-  TOP_K       = 20
+  TOP_K       =   20
 
   # How one request should think. `instruction` is the system-message line (nil for none).
   record Mode, enabled : Bool, instruction : String?

@@ -3,7 +3,7 @@ require "../examples/agent_markdown"
 
 private def render(text : String, width = 80, chunk = 0) : String
   io = IO::Memory.new
-  md = AgentDemo::Markdown.new(io, ->{ width }, true, true)
+  md = AgentDemo::Markdown.new(io, -> { width }, true, true)
   if chunk > 0
     i = 0
     while i < text.size
@@ -45,7 +45,7 @@ describe AgentDemo::Markdown do
 
   it "passes text through untouched when color is off" do
     io = IO::Memory.new
-    md = AgentDemo::Markdown.new(io, ->{ 80 }, false)
+    md = AgentDemo::Markdown.new(io, -> { 80 }, false)
     md.feed("# T\n| a |\n**x**")
     md.finish
     io.to_s.should eq("# T\n| a |\n**x**")

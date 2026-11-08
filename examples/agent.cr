@@ -998,7 +998,7 @@ module AgentDemo
     def initialize(@io : IO)
       # The answer is rendered as markdown; "Agent ❯ " is already on the line, hence col0 false.
       tty = @io.is_a?(IO::FileDescriptor) && @io.as(IO::FileDescriptor).tty?
-      @md = AgentDemo::Markdown.new(@io, ->{ AgentDemo.term_cols }, Colorize.enabled? && tty, col0: false)
+      @md = AgentDemo::Markdown.new(@io, -> { AgentDemo.term_cols }, Colorize.enabled? && tty, col0: false)
       @mode = :normal
       @pending = ""
       @started = false
@@ -1735,7 +1735,7 @@ module AgentDemo
     end
 
     # Longest summary the model may write, and the instruction it gets.
-    SUMMARY_TOKENS = 1024
+    SUMMARY_TOKENS      = 1024
     SUMMARY_INSTRUCTION = "Write a summary of the conversation so far. It will REPLACE the older " \
                           "messages, so it must carry everything still needed to continue: the user's " \
                           "goals and requests, decisions made, every file path read or changed, commands " \
