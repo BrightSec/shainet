@@ -179,7 +179,7 @@ module AgentDemo
   # With color off (output not a terminal) the text passes through untouched, so piped output is
   # still the model's markdown.
   class Markdown
-    property col0 : Bool
+    property? col0 : Bool
 
     def initialize(@io : IO, @width : Proc(Int32) = -> { 100 }, @color : Bool = Colorize.enabled?,
                    @col0 : Bool = true)
@@ -416,7 +416,7 @@ module AgentDemo
     end
 
     private def separator?(cells : Array(String)) : Bool
-      cells.all? { |c| c.matches?(/\A:?-{1,}:?\z/) }
+      cells.all?(&.matches?(/\A:?-{1,}:?\z/))
     end
 
     private def draw_table(head : Array(String), sep : Array(String), body : Array(Array(String)))
@@ -467,7 +467,7 @@ module AgentDemo
         w[i] -= 1
       end
       while w.sum > avail
-        i = w.index(w.max).not_nil!
+        i = w.index!(w.max)
         break if w[i] <= 4
         w[i] -= 1
       end
@@ -624,15 +624,15 @@ module AgentDemo
     HASH_COMMENT = Set{"crystal", "cr", "ruby", "rb", "python", "py", "sh", "bash", "shell", "zsh", "console",
                        "yaml", "yml", "toml", "perl", "r", "make", "makefile", "dockerfile", "nim", "ini", "conf"}
     DASH_COMMENT = Set{"sql", "lua", "haskell", "hs"}
-    KEYWORDS     = Set.new(%w(def end if else elsif elif unless while until for in do return class module struct
+    KEYWORDS     = Set.new(%w[def end if else elsif elif unless while until for in do return class module struct
       enum lib fun macro require include extend private protected public self super nil true false and or not
       then case when begin rescue ensure raise yield lambda proc import from as with try except finally pass
       break continue let const var function new delete typeof instanceof async await export default interface
       type implements package static void int char float double long short unsigned signed bool auto namespace
       using template typename sizeof switch fn mut impl trait pub use match loop where mod echo fi done esac
-      local null undefined this None True False abstract alias annotation getter setter property record))
-    SQL_KEYWORDS = Set.new(%w(select from where insert into update delete create table join left right inner on
-      group by order having limit values set and or not null as distinct count))
+      local null undefined this None True False abstract alias annotation getter setter property record])
+    SQL_KEYWORDS = Set.new(%w[select from where insert into update delete create table join left right inner on
+      group by order having limit values set and or not null as distinct count])
     TOKEN = /(?<str>"(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?|`[^`]*`?)|(?<num>\b\d[\w.]*)|(?<sym>(?<![:\w]):[a-z_]\w*[?!]?)|(?<word>[A-Za-z_]\w*[?!]?)/
 
     def self.line(text : String, lang : String) : String

@@ -532,8 +532,6 @@ module SHAInet
         # Re-parse the KV section to extract tokenizer data.
         # We need: tokenizer.ggml.tokens, tokenizer.ggml.merges
         ptr = gf.mmap_ptr.not_nil!
-        pos = 12_u64 # skip magic(4) + version(4) + tensor_count(8) -- wait, version is u32
-        # Actually reparse from scratch using the mmap
         pos = 0_u64
         _magic = (ptr + pos).as(Pointer(UInt32)).value; pos += 4
         _version = (ptr + pos).as(Pointer(UInt32)).value; pos += 4

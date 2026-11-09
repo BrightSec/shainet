@@ -560,8 +560,7 @@ module SHAInet
     def self.element_multiply!(output : CudaMatrix, a : CudaMatrix, b : CudaMatrix, alpha : Float64 = 1.0, beta : Float64 = 0.0)
       raise "Matrices must have same dimensions" unless a.rows == b.rows && a.cols == b.cols && output.rows == a.rows && output.cols == a.cols
 
-      # Create OpTensor descriptor
-      op_desc = uninitialized LibCUDNN::CudnnOpTensorDescriptor
+      # Create OpTensor descriptor (`out` declares op_desc)
       CUDNN.check_status(LibCUDNN.cudnnCreateOpTensorDescriptor(out op_desc))
 
       begin
@@ -650,8 +649,7 @@ module SHAInet
     def self.element_addition!(output : CudaMatrix, a : CudaMatrix, b : CudaMatrix, alpha : Float64 = 1.0, beta : Float64 = 1.0)
       raise "Matrices must have same dimensions" unless a.rows == b.rows && a.cols == b.cols && output.rows == a.rows && output.cols == a.cols
 
-      # Create OpTensor descriptor
-      op_desc = uninitialized LibCUDNN::CudnnOpTensorDescriptor
+      # Create OpTensor descriptor (`out` declares op_desc)
       CUDNN.check_status(LibCUDNN.cudnnCreateOpTensorDescriptor(out op_desc))
 
       begin

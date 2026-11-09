@@ -8,9 +8,9 @@ end
 # Same reasoning/tool-call stripping the server applies, reduced to what the stream filter needs.
 private def answer_of(raw : String) : String
   a = raw.gsub(/<think>.*?<\/think>/m, "")
-  a = a[0, a.index("<think>").not_nil!] if a.includes?("<think>")
+  a = a[0, a.index!("<think>")] if a.includes?("<think>")
   a = a.gsub(/<tool_call>.*?<\/tool_call>/m, "")
-  a = a[0, a.index("<tool_call>").not_nil!] if a.includes?("<tool_call>")
+  a = a[0, a.index!("<tool_call>")] if a.includes?("<tool_call>")
   a.strip
 end
 
@@ -24,22 +24,26 @@ describe OpenAIResponses do
     end
 
     it "reads message items with text parts and maps developer to system" do
-      msgs = OpenAIResponses.parse_input(j(%([
-        {"role": "developer", "content": "rules"},
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]}
-      ])))
+      msgs = OpenAIResponses.parse_input(j(<<-JSON))
+        [
+          {"role": "developer", "content": "rules"},
+          {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]}
+        ]
+        JSON
       msgs.map(&.role).should eq(["system", "user"])
       msgs[1].content.should eq("a\nb")
     end
 
     it "groups function_call items into one assistant turn and maps outputs to tool messages" do
-      msgs = OpenAIResponses.parse_input(j(%([
-        {"role": "user", "content": "go"},
-        {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{\\"path\\":\\"a\\"}"},
-        {"type": "function_call", "call_id": "c2", "name": "read", "arguments": {"path": "b"}},
-        {"type": "function_call_output", "call_id": "c1", "output": "A"},
-        {"type": "reasoning", "summary": []}
-      ])))
+      msgs = OpenAIResponses.parse_input(j(<<-JSON))
+        [
+          {"role": "user", "content": "go"},
+          {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{\\"path\\":\\"a\\"}"},
+          {"type": "function_call", "call_id": "c2", "name": "read", "arguments": {"path": "b"}},
+          {"type": "function_call_output", "call_id": "c1", "output": "A"},
+          {"type": "reasoning", "summary": []}
+        ]
+        JSON
       msgs.map(&.role).should eq(["user", "assistant", "tool"])
       msgs[1].content.should be_nil
       msgs[1].calls.map(&.call_id).should eq(["c1", "c2"])
@@ -49,14 +53,16 @@ describe OpenAIResponses do
     end
 
     it "attaches an echoed reasoning item to the assistant turn after it" do
-      msgs = OpenAIResponses.parse_input(j(%([
-        {"role": "user", "content": "go"},
-        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan it"}]},
-        {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "c1", "output": "A"},
-        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "done"}]},
-        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}
-      ])))
+      msgs = OpenAIResponses.parse_input(j(<<-JSON))
+        [
+          {"role": "user", "content": "go"},
+          {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan it"}]},
+          {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
+          {"type": "function_call_output", "call_id": "c1", "output": "A"},
+          {"type": "reasoning", "summary": [{"type": "summary_text", "text": "done"}]},
+          {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}
+        ]
+        JSON
       msgs.map(&.role).should eq(["user", "assistant", "tool", "assistant"])
       msgs[1].reasoning.should eq("plan it")
       msgs[3].reasoning.should eq("done")
@@ -71,11 +77,13 @@ describe OpenAIResponses do
 
   describe ".tool_defs / .tool_choice" do
     it "accepts flat Responses tools and nested Chat tools, skipping built-ins" do
-      defs = OpenAIResponses.tool_defs(j(%([
-        {"type": "function", "name": "a", "description": "d", "parameters": {"type": "object"}},
-        {"type": "function", "function": {"name": "b"}},
-        {"type": "web_search"}
-      ])))
+      defs = OpenAIResponses.tool_defs(j(<<-JSON))
+        [
+          {"type": "function", "name": "a", "description": "d", "parameters": {"type": "object"}},
+          {"type": "function", "function": {"name": "b"}},
+          {"type": "web_search"}
+        ]
+        JSON
       defs.map(&.name).should eq(["a", "b"])
       defs[0].description.should eq("d")
     end
@@ -155,8 +163,8 @@ describe OpenAIResponses do
     it "writes typed SSE events with increasing sequence numbers" do
       buf = [] of String
       w = OpenAIResponses::EventWriter.new { |s| buf << s; nil }
-      w.emit("response.created") { |jb| jb.field "x", 1 }
-      w.emit("response.completed") { |jb| jb.field "x", 2 }
+      w.emit("response.created", &.field("x", 1))
+      w.emit("response.completed", &.field("x", 2))
       buf[0].should start_with("event: response.created\ndata: ")
       JSON.parse(buf[1].split("data: ")[1])["sequence_number"].should eq(1)
     end

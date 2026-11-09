@@ -4,6 +4,7 @@
 #include <mma.h>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 #include "iq_tables.cuh"  // i-quant codebook grids in constant memory
 
 // Device kernels
@@ -1343,6 +1344,152 @@ template <> struct KVStore<__nv_fp8_e4m3> {
     __device__ static inline void store(__nv_fp8_e4m3* p, long i, float v) { p[i] = __nv_fp8_e4m3(v); }
 };
 
+// ---- 4-bit KV cache (SHAINET_KV_DTYPE=q4) ----------------------------------------------------
+//
+// One cached position is one ROW: the fp16 scales of its 32-value groups (padded to 16 bytes),
+// then head_dim/2 bytes of 4-bit codes, two per byte (low nibble = even element). Symmetric q4_0
+// per group, as llama.cpp's q4_0: v = scale * (code - 8). Rows are a multiple of 16 bytes so the
+// prefill kernel's cp.async copies them whole: 144 bytes at head_dim 256 against 256 for fp8.
+//
+// KEYS are stored ROTATED by a fixed orthogonal R = H128 * diag(signs), a randomized Hadamard per
+// 128-dim block. It spreads a few large channels across the block so one group scale fits all 32
+// values. Attention rotates q by the same R, and since q.k = (Rq).(Rk) the keys are never rotated
+// back. VALUES are not rotated. Measured on the 27B at 30K context, as KL vs an f16 cache: plain
+// q4_0 0.0028, keys rotated 0.0018 (worst token 0.027, close to fp8's 0.021), keys and values
+// rotated 0.0025 (worst 0.082). SAW-INT4 (arXiv 2604.19157) reports the same: rotating keys suffices.
+struct kvq4_t { unsigned char b; };   // tag type: the q4 cache travels as kvq4_t* pointers
+
+__host__ __device__ constexpr int kvq4_scale_bytes(int D) { return ((D / 32) * 2 + 15) / 16 * 16; }
+__host__ __device__ constexpr int kvq4_row_bytes(int D) { return kvq4_scale_bytes(D) + D / 2; }
+
+// The rotation's sign pattern: a fixed hash of the dimension index, identical for keys and queries.
+__device__ __forceinline__ float kvq4_sign(int i) {
+    unsigned int h = (unsigned int)i * 2654435761u;
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return (h & 1u) ? -1.0f : 1.0f;
+}
+
+// In-place normalized Walsh-Hadamard transform over blocks of min(D, 128) of s[0..D), one thread per
+// element. A pair (i, i + len) never crosses a block since len < block and bit `len` of i is clear.
+__device__ __forceinline__ void kvq4_fwht(float* s, int tid, int D) {
+    const int blk = D < 128 ? D : 128;
+    for (int len = 1; len < blk; len <<= 1) {
+        __syncthreads();
+        float a = 0.0f, b = 0.0f;
+        const bool lo = (tid & len) == 0;
+        if (lo) { a = s[tid]; b = s[tid + len]; }
+        __syncthreads();
+        if (lo) { s[tid] = a + b; s[tid + len] = a - b; }
+    }
+    __syncthreads();
+    s[tid] *= rsqrtf((float)blk);
+    __syncthreads();
+}
+
+__device__ __forceinline__ float kvq4_load(const unsigned char* row, int d, int D) {
+    const float sc = __half2float(((const __half*)row)[d >> 5]);
+    const unsigned int b = row[kvq4_scale_bytes(D) + (d >> 1)];
+    return sc * (float)((int)((b >> ((d & 1) * 4)) & 15u) - 8);
+}
+// Eight values starting at d (a multiple of 8, so they share one group and one aligned word).
+__device__ __forceinline__ void kvq4_load8f(const unsigned char* row, int d, int D, float* f) {
+    const float sc = __half2float(((const __half*)row)[d >> 5]);
+    const unsigned int w = *((const unsigned int*)(row + kvq4_scale_bytes(D) + (d >> 1)));
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) f[i] = sc * (float)((int)((w >> (4 * i)) & 15u) - 8);
+}
+
+// Row-addressed access to the cache, so a kernel can serve element types (fp32, fp16, fp8) and the
+// packed q4 rows alike. For the element types a row is head_dim * sizeof(KV) bytes and the accessors
+// are the ones those kernels always used.
+__device__ __forceinline__ void kv_load8f(const __half* p, float* f);
+__device__ __forceinline__ void kv_load8f(const __nv_fp8_e4m3* p, float* f);
+__device__ __forceinline__ uint4 kv_to_half8(const __half* p);
+__device__ __forceinline__ uint4 kv_to_half8(const __nv_fp8_e4m3* p);
+
+template <typename KV> struct KVRow {
+    __host__ __device__ static constexpr int bytes(int D) { return D * (int)sizeof(KV); }
+    __device__ static inline float load(const unsigned char* row, int d, int) {
+        return KVStore<KV>::load((const KV*)row, d);
+    }
+    __device__ static inline void load8f(const unsigned char* row, int d, int, float* f) {
+        kv_load8f((const KV*)row + d, f);
+    }
+    __device__ static inline uint4 half8(const unsigned char* row, int d, int) {
+        return kv_to_half8((const KV*)row + d);
+    }
+};
+template <> struct KVRow<kvq4_t> {
+    __host__ __device__ static constexpr int bytes(int D) { return kvq4_row_bytes(D); }
+    __device__ static inline float load(const unsigned char* row, int d, int D) { return kvq4_load(row, d, D); }
+    __device__ static inline void load8f(const unsigned char* row, int d, int D, float* f) {
+        kvq4_load8f(row, d, D, f);
+    }
+    __device__ static inline uint4 half8(const unsigned char* row, int d, int D) {
+        float f[8];
+        kvq4_load8f(row, d, D, f);
+        uint4 r;
+        __half2 h;
+        h = __floats2half2_rn(f[0], f[1]); r.x = *((unsigned int*)&h);
+        h = __floats2half2_rn(f[2], f[3]); r.y = *((unsigned int*)&h);
+        h = __floats2half2_rn(f[4], f[5]); r.z = *((unsigned int*)&h);
+        h = __floats2half2_rn(f[6], f[7]); r.w = *((unsigned int*)&h);
+        return r;
+    }
+};
+
+// Start of (kv head, position) row in a cache of `capacity` rows per head.
+template <typename KV>
+__device__ __forceinline__ const unsigned char* kv_row(const KV* base, int kv_h, long j, int capacity, int D) {
+    return (const unsigned char*)base + ((long)kv_h * capacity + j) * KVRow<KV>::bytes(D);
+}
+
+// Append new_tokens rows per kv head: rotate K, quantize K and V. One block (D threads) per vector,
+// a warp per 32-value group. Staging layout as kv_cache_append_kernel_t: K chunks then V chunks,
+// kv_head-major, token-major within a head.
+__global__ void kv_append_q4_kernel(const float* __restrict__ staging, unsigned char* __restrict__ kc,
+                                    unsigned char* __restrict__ vc, int new_tokens, int start_pos,
+                                    int num_kv_heads, int D, int capacity) {
+    extern __shared__ float s[];
+    const int vec = blockIdx.x, tid = threadIdx.x;
+    const int per = num_kv_heads * new_tokens;
+    const bool is_v = vec >= per;
+    const int r = is_v ? vec - per : vec;
+    const int kv_h = r / new_tokens, t = r - kv_h * new_tokens;
+    float x = staging[(long)vec * D + tid];
+    if (!is_v) {   // uniform per block, so the barriers inside are safe
+        s[tid] = x * kvq4_sign(tid);
+        kvq4_fwht(s, tid, D);
+        x = s[tid];
+    }
+    float amax = fabsf(x), sv = x;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float oa = __shfl_xor_sync(0xFFFFFFFF, amax, o);
+        const float os = __shfl_xor_sync(0xFFFFFFFF, sv, o);
+        if (oa > amax) { amax = oa; sv = os; }
+    }
+    const __half dh = __float2half(sv / -8.0f);
+    const float d = __half2float(dh);
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    int qi = (int)(x * id + 8.5f);
+    qi = qi < 0 ? 0 : (qi > 15 ? 15 : qi);
+    const int hi = __shfl_down_sync(0xFFFFFFFF, qi, 1);
+    unsigned char* row = (is_v ? vc : kc) + ((long)kv_h * capacity + start_pos + t) * kvq4_row_bytes(D);
+    if ((tid & 31) == 0) ((__half*)row)[tid >> 5] = dh;
+    if ((tid & 1) == 0) row[kvq4_scale_bytes(D) + (tid >> 1)] = (unsigned char)(qi | (hi << 4));
+}
+
+// Rotate every query head vector by R in place: [rows][num_heads * D].
+__global__ void kv_q4_rotate_kernel(float* __restrict__ q, int D) {
+    extern __shared__ float s[];
+    const int tid = threadIdx.x;
+    float* p = q + (long)blockIdx.x * D;
+    s[tid] = p[tid] * kvq4_sign(tid);
+    kvq4_fwht(s, tid, D);
+    p[tid] = s[tid];
+}
+
 // `staging` holds the newly appended rows, already RoPE'd (K) on the host:
 //   [num_kv_heads * new_tokens * head_dim] K chunks (kv_head-major, then
 //   token-major — i.e. each kv_head's tail is contiguous), followed by the
@@ -1476,8 +1623,9 @@ __global__ void attention_split_kv_kernel(const float* __restrict__ q,
     const int d_model = num_heads * head_dim;
 
     const float* qv = q + (long)i * d_model + (long)h * head_dim;
-    const KV* kh = kc + (long)kv_h * capacity * head_dim;
-    const KV* vh = vc + (long)kv_h * capacity * head_dim;
+    const int rb = KVRow<KV>::bytes(head_dim);
+    const unsigned char* kh = kv_row(kc, kv_h, 0, capacity, head_dim);
+    const unsigned char* vh = kv_row(vc, kv_h, 0, capacity, head_dim);
 
     // This split's key range.
     const int j0 = sp * ATTN_SPLIT_SCORES;
@@ -1505,9 +1653,9 @@ __global__ void attention_split_kv_kernel(const float* __restrict__ q,
     // Scores for this slice, into SHARED memory. Max tracked for a stable softmax.
     float lmax = -INFINITY;
     for (int j = j0 + tid; j < j1; j += nt) {
-        const KV* krow = kh + (long)j * head_dim;
+        const unsigned char* krow = kh + (long)j * rb;
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += q_s[d] * KVStore<KV>::load(krow, d);
+        for (int d = 0; d < head_dim; ++d) dot += q_s[d] * KVRow<KV>::load(krow, d, head_dim);
         dot *= scale;
         sc[j - j0] = dot;
         if (dot > lmax) lmax = dot;
@@ -1541,7 +1689,7 @@ __global__ void attention_split_kv_kernel(const float* __restrict__ q,
     for (int d = tid; d < head_dim; d += nt) {
         float acc = 0.0f;
         for (int j = j0; j < j1; ++j) {
-            acc += sc[j - j0] * KVStore<KV>::load(vh, (long)j * head_dim + d);
+            acc += sc[j - j0] * KVRow<KV>::load(vh + (long)j * rb, d, head_dim);
         }
         part_out[pidx * head_dim + d] = acc;
     }
@@ -1736,8 +1884,9 @@ __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
     const int j0 = sp * ATTN_SPLIT_SCORES;
     const int j1 = min(j0 + ATTN_SPLIT_SCORES, visible);
     const int h0 = kvh * hpk;
-    const KV* kh = kc + (long)kvh * capacity * D;
-    const KV* vh = vc + (long)kvh * capacity * D;
+    constexpr int RB = KVRow<KV>::bytes(D);
+    const unsigned char* kh = kv_row(kc, kvh, 0, capacity, D);
+    const unsigned char* vh = kv_row(vc, kvh, 0, capacity, D);
 
     if (j0 >= j1) {   // empty split: the combine's identity (max -inf, sum 0, zero partial)
         for (int i = tid; i < hpk * D; i += DGQA_THREADS) {
@@ -1761,11 +1910,12 @@ __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
 
     for (int j = j0 + warp; j < j1; j += DGQA_THREADS / 32) {
         float kf[8];
+        const unsigned char* krow = kh + (long)j * RB;
         if (DPL == 8) {
-            kv_load8f(kh + (long)j * D + lane * 8, kf);
+            KVRow<KV>::load8f(krow, lane * 8, D, kf);
         } else {
             #pragma unroll
-            for (int e = 0; e < DPL; ++e) kf[e] = KVStore<KV>::load(kh, (long)j * D + lane * DPL + e);
+            for (int e = 0; e < DPL; ++e) kf[e] = KVRow<KV>::load(krow, lane * DPL + e, D);
         }
         float s[DGQA_MAX_HPK];
         #pragma unroll
@@ -1817,7 +1967,7 @@ __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
     for (int hl = 0; hl < DGQA_MAX_HPK; ++hl) acc[hl] = 0.0f;
     #pragma unroll 4
     for (int i = grp; i < nk; i += G) {
-        const float v = KVStore<KV>::load(vh, (long)(j0 + i) * D + d);
+        const float v = KVRow<KV>::load(vh + (long)(j0 + i) * RB, d, D);
         #pragma unroll
         for (int hl = 0; hl < DGQA_MAX_HPK; ++hl)
             if (hl < hpk) acc[hl] += sc[hl][i] * v;
@@ -2547,7 +2697,8 @@ __global__ void __launch_bounds__(128) attention_prefill_fa3_kernel(
     __half* Ks = Qs + FA2_BQ * LD;              // [BK][LD]
     __half* Vs = Ks + FA2_BK * LD;              // [BK][LD]
     // Raw cache bytes of the NEXT key tile, fetched with cp.async while this one is computed.
-    constexpr int RAWB = FA2_BK * D * (int)sizeof(KV);
+    constexpr int RB = KVRow<KV>::bytes(D);     // bytes per cached row (a multiple of 16)
+    constexpr int RAWB = FA2_BK * RB;
     unsigned char* Kraw = (unsigned char*)(Vs + FA2_BK * LD);
     unsigned char* Vraw = Kraw + RAWB;
 
@@ -2558,8 +2709,8 @@ __global__ void __launch_bounds__(128) attention_prefill_fa3_kernel(
     const int d_model = num_heads * D;
     const int rows = min(FA2_BQ, new_tokens - q0);
     const int kend = start_pos + q0 + rows;
-    const KV* kh = kc + (long)kv_h * capacity * D;
-    const KV* vh = vc + (long)kv_h * capacity * D;
+    const unsigned char* kh = kv_row(kc, kv_h, 0, capacity, D);
+    const unsigned char* vh = kv_row(vc, kv_h, 0, capacity, D);
 
     for (int idx = tid; idx < FA2_BQ * D; idx += 128) {
         const int qi = idx / D, d = idx - qi * D;
@@ -2578,14 +2729,14 @@ __global__ void __launch_bounds__(128) attention_prefill_fa3_kernel(
 
     // Issue the raw copy of key tile j0 (rows past kend are zero-filled).
     auto fetch = [&](int j0) {
-        constexpr int C16 = D * (int)sizeof(KV) / 16;   // 16-byte chunks per row
+        constexpr int C16 = RB / 16;   // 16-byte chunks per row
         for (int idx = tid; idx < FA2_BK * C16; idx += 128) {
             const int kj = idx / C16, c = idx - kj * C16;
             const int j = j0 + kj;
             const bool ok = j < kend;
-            const long off = (long)(ok ? j : 0) * D * (long)sizeof(KV) + c * 16;
-            fa3_cp16(Kraw + kj * D * sizeof(KV) + c * 16, (const unsigned char*)kh + off, ok);
-            fa3_cp16(Vraw + kj * D * sizeof(KV) + c * 16, (const unsigned char*)vh + off, ok);
+            const long off = (long)(ok ? j : 0) * RB + c * 16;
+            fa3_cp16(Kraw + kj * RB + c * 16, kh + off, ok);
+            fa3_cp16(Vraw + kj * RB + c * 16, vh + off, ok);
         }
         asm volatile("cp.async.commit_group;\n" ::);
     };
@@ -2596,8 +2747,8 @@ __global__ void __launch_bounds__(128) attention_prefill_fa3_kernel(
         constexpr int V8 = D / 8;
         for (int idx = tid; idx < FA2_BK * V8; idx += 128) {
             const int kj = idx / V8, d = (idx - kj * V8) * 8;
-            *(uint4*)(Ks + kj * LD + d) = kv_to_half8((const KV*)(Kraw) + kj * D + d);
-            *(uint4*)(Vs + kj * LD + d) = kv_to_half8((const KV*)(Vraw) + kj * D + d);
+            *(uint4*)(Ks + kj * LD + d) = KVRow<KV>::half8(Kraw + kj * RB, d, D);
+            *(uint4*)(Vs + kj * LD + d) = KVRow<KV>::half8(Vraw + kj * RB, d, D);
         }
         __syncthreads();   // converted tile visible; raw buffer free
         if (j0 + FA2_BK < kend) fetch(j0 + FA2_BK);
@@ -2716,7 +2867,7 @@ static int attention_prefill_fa2_launch_d(const float* q, const KV* kc, const KV
                                           int heads_per_kv, int capacity, float scale) {
     const size_t smem = (size_t)(FA2_BQ + 2 * FA2_BK) * (D + 8) * sizeof(__half);
     static int state3 = 0;
-    const size_t smem3 = smem + 2 * (size_t)FA2_BK * D * sizeof(KV);
+    const size_t smem3 = smem + 2 * (size_t)FA2_BK * KVRow<KV>::bytes(D);
     if (state3 == 0) {
         int dev = 0, major = 0;
         cudaGetDevice(&dev);
@@ -2894,6 +3045,80 @@ void attention_kv_fp8(const float* q, const unsigned char* kc, const unsigned ch
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error in attention_kv_fp8: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// ---- q4 KV cache entry points (layout and rotation: see KVRow<kvq4_t>) ----------------------------
+// head_dim must be a power of two in [32, 1024]; the device paths below serve 128 and 256.
+
+void kv_cache_append_q4(const float* staging, unsigned char* kc, unsigned char* vc,
+                        int new_tokens, int start_pos, int num_kv_heads, int head_dim, int capacity) {
+    const int vecs = 2 * num_kv_heads * new_tokens;
+    if (vecs <= 0) return;
+    kv_append_q4_kernel<<<vecs, head_dim, head_dim * sizeof(float)>>>(staging, kc, vc, new_tokens,
+                                                                       start_pos, num_kv_heads,
+                                                                       head_dim, capacity);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) printf("CUDA Error in kv_cache_append_q4: %s\n", cudaGetErrorString(err));
+}
+
+// Rotate `rows` query rows of num_heads heads in place, as keys were rotated on append.
+void kv_q4_rotate_q(float* q, int rows, int num_heads, int head_dim) {
+    const int vecs = rows * num_heads;
+    if (vecs <= 0) return;
+    kv_q4_rotate_kernel<<<vecs, head_dim, head_dim * sizeof(float)>>>(q, head_dim);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) printf("CUDA Error in kv_q4_rotate_q: %s\n", cudaGetErrorString(err));
+}
+
+// q must already be rotated (kv_q4_rotate_q).
+void attention_split_kv_q4(const float* q, const unsigned char* kc, const unsigned char* vc,
+                           float* out, float* ws, int new_tokens, int start_pos,
+                           int num_heads, int heads_per_kv, int head_dim,
+                           int capacity, float scale) {
+    attention_split_kv_launch<kvq4_t>(q, reinterpret_cast<const kvq4_t*>(kc),
+                                      reinterpret_cast<const kvq4_t*>(vc),
+                                      out, ws, new_tokens, start_pos,
+                                      num_heads, heads_per_kv, head_dim, capacity, scale);
+}
+
+// Tiled prefill over the q4 cache: the FA3 kernel only (FA2, WMMA and the scalar tiled kernel read
+// typed elements). 0 declines, and the caller falls back to the split path. q must be rotated.
+int attention_prefill_q4(const float* q, const unsigned char* kc, const unsigned char* vc,
+                         float* out, int new_tokens, int start_pos, int num_heads,
+                         int heads_per_kv, int head_dim, int capacity, float scale) {
+    if (new_tokens <= 0) return 0;
+    const kvq4_t* k = reinterpret_cast<const kvq4_t*>(kc);
+    const kvq4_t* v = reinterpret_cast<const kvq4_t*>(vc);
+    auto launch = [&](auto dtag) -> int {
+        constexpr int D = decltype(dtag)::value;
+        const size_t smem = (size_t)(FA2_BQ + 2 * FA2_BK) * (D + 8) * sizeof(__half) +
+                            2 * (size_t)FA2_BK * KVRow<kvq4_t>::bytes(D);
+        static int state = 0;
+        if (state == 0) {
+            int dev = 0, major = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            state = (major >= 8 && cudaFuncSetAttribute(attention_prefill_fa3_kernel<kvq4_t, D>,
+                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                        (int)smem) == cudaSuccess) ? 1 : -1;
+            cudaGetLastError();
+        }
+        if (state < 0) return 0;
+        dim3 grid((new_tokens + FA2_BQ - 1) / FA2_BQ, num_heads);
+        attention_prefill_fa3_kernel<kvq4_t, D><<<grid, 128, smem>>>(q, k, v, out, new_tokens, start_pos,
+                                                                     num_heads, heads_per_kv, capacity, scale);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("CUDA Error in attention_prefill_q4: %s\n", cudaGetErrorString(err));
+            return 0;
+        }
+        return 1;
+    };
+    switch (head_dim) {
+    case 128: return launch(std::integral_constant<int, 128>{});
+    case 256: return launch(std::integral_constant<int, 256>{});
+    default: return 0;
     }
 }
 

@@ -553,12 +553,12 @@ module SHAInet
     # Accept a sequence of integer tokens for embedding layers
     # This is a convenience wrapper around the standard run method
     def run(input : Array(Array(Int32)), stealth : Bool = false) : Array(Array(Float64))
-      seq = input.map { |x| x.map(&.to_f64) }
+      seq = input.map(&.map(&.to_f64))
       run(seq, stealth: stealth)
     end
 
     def run(input : Array(Array(Int32)), *, return_matrix : Bool, stealth : Bool = false) : Array(Array(Float64)) | CudaMatrix | SimpleMatrix
-      seq = input.map { |x| x.map(&.to_f64) }
+      seq = input.map(&.map(&.to_f64))
       run(seq, stealth: stealth, return_matrix: return_matrix)
     end
 
@@ -822,7 +822,7 @@ module SHAInet
 
     # Convenience wrapper for integer inputs
     def evaluate_sequence_label(input_data : Array(Array(Int32)), label : Int32)
-      seq = input_data.map { |x| x.map(&.to_f64) }
+      seq = input_data.map(&.map(&.to_f64))
       evaluate_sequence_label(seq, label)
     end
 
@@ -896,7 +896,7 @@ module SHAInet
 
     # Evaluate a sequence example with a class label and softmax cross entropy
     def evaluate_sequence_label(input_data : Array(Array(GenNum)), label : Int32)
-      seq = input_data.map { |x| x.map(&.to_f64) }
+      seq = input_data.map(&.map(&.to_f64))
       matrix = GPUMemory.to_gpu(SimpleMatrix.from_a(seq))
       logits = run(matrix, stealth: true)
 
@@ -1215,7 +1215,7 @@ module SHAInet
                               case arr
                               when Array(Array(GenNum)), Array(Array(Float64))
                                 # 2D: arr is Array(Array(GenNum)) or Array(Array(Float64))
-                                GPUMemory.to_gpu!(arr.map { |row| row.map(&.to_f64) }, expected_workspace)
+                                GPUMemory.to_gpu!(arr.map(&.map(&.to_f64)), expected_workspace)
                               when Array(Float64)
                                 # 1D: arr is Array(Float64)
                                 GPUMemory.to_gpu!([arr], expected_workspace)

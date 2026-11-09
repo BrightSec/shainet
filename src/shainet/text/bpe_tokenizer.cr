@@ -20,10 +20,10 @@ module SHAInet
     # Pre-tokenizer regexes by GGUF `tokenizer.ggml.pre` name, as in llama.cpp's llama-vocab.cpp
     # (the tokenizer.json originals; PCRE2 takes them as written).
     PRE_REGEXES = {
-      "qwen35"    => %q{(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+},
-      "qwen2"     => %q{(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+},
-      "llama-bpe" => %q{(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+},
-      "gpt2"      => %q{'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+},
+      "qwen35"    => %q((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+),
+      "qwen2"     => %q((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+),
+      "llama-bpe" => %q((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+),
+      "gpt2"      => %q('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+),
     }
 
     # Select the pre-tokenizer for a GGUF `tokenizer.ggml.pre` value. Unknown names leave it unset.
@@ -46,7 +46,7 @@ module SHAInet
       return if token.empty?
       @literal_ids[token] = id
       # Longest first, so a token that prefixes another cannot win.
-      @literal_regex = Regex.union(@literal_ids.keys.sort_by { |t| -t.bytesize })
+      @literal_regex = Regex.union(@literal_ids.keys.sort_by! { |t| -t.bytesize })
     end
 
     # Merge table keyed by token-id pair, built on first use: (a << 32 | b) -> {rank, merged id}.
@@ -158,10 +158,10 @@ module SHAInet
 
     # The Split regex of a tokenizer.json pre_tokenizer, alone or inside a Sequence.
     private def self.hf_split_regex(pre : JSON::Any?) : String?
-      return nil unless pre && (h = pre.as_h?)
+      return unless pre && (h = pre.as_h?)
       case h["type"]?.try(&.as_s?)
       when "Split"
-        h["pattern"]?.try { |pt| pt["Regex"]?.try(&.as_s?) }
+        h["pattern"]?.try(&.["Regex"]?.try(&.as_s?))
       when "Sequence"
         h["pretokenizers"]?.try(&.as_a?).try &.each do |sub|
           if r = hf_split_regex(sub)
