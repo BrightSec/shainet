@@ -483,7 +483,7 @@ module SHAInet
       layers.each_with_index do |layer_data, idx|
         next if idx == 0 # input layer has no weights to set
         dest_layer = all_layers[idx - 1]
-        w = layer_data["weights"].as_a.map { |r| r.as_a.map(&.as_f) }
+        w = layer_data["weights"].as_a.map(&.as_a.map(&.as_f))
         b = layer_data["biases"].as_a.map(&.as_f)
         dest_layer.weights = SimpleMatrix.from_a(w)
         dest_layer.biases = SimpleMatrix.from_a([b])

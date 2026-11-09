@@ -190,7 +190,7 @@ module SHAInet
 
     # Save the current recurrent state (host and device) into this block's single save slot.
     def save_state!
-      @saved_state = @state.map { |m| m.try(&.clone) }
+      @saved_state = @state.map(&.try(&.clone))
       @saved_conv_q = @conv_state_q.try(&.clone)
       @saved_conv_k = @conv_state_k.try(&.clone)
       @saved_conv_v = @conv_state_v.try(&.clone)

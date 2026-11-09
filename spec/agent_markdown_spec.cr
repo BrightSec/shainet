@@ -33,7 +33,7 @@ describe AgentDemo::Markdown do
     text = "| # | Severity | Notes |\n|---|---|---|\n| 1 | 🔴 High | a fairly long note that has to wrap somewhere |\n| 2 | 🟡 Low | 日本語 |\n"
     lines = plain(render(text, width: 40)).lines.select { |l| l.starts_with?('│') || l.starts_with?('┌') }
     lines.size.should be > 3
-    lines.map { |l| AgentDemo::TermWidth.of(l) }.uniq.size.should eq(1)
+    lines.map { |l| AgentDemo::TermWidth.of(l) }.uniq!.size.should eq(1)
     lines.each { |l| AgentDemo::TermWidth.of(l).should be <= 40 }
   end
 

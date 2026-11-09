@@ -382,7 +382,6 @@ module OpenAIServer
         # which of those is happening, and on this model a host-resident layer costs about a second per
         # TOKEN, so the difference is the whole diagnosis.
         pf = Time.instant
-        reused = 0
         begin
           reused = rewind_to_prefix(prompt_ids)
           tail = prompt_ids[reused..]

@@ -1541,7 +1541,6 @@ module SHAInet
     # sized for that chunk.
     private def ensure_gpu_cache!(total_len : Int32, max_chunk : Int32)
       return if @gpu_cache_cap >= total_len
-      head_dim = @head_dim
 
       new_cap = if budget = kv_max_context
                   if total_len > budget
