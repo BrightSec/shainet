@@ -1449,35 +1449,48 @@ module SHAInet
 
     # Storage type of the device KV cache. Arithmetic is fp32 for all three -- the kernels convert on
     # load -- so only the stored precision and the VRAM it costs differ.
+    #
+    # Q4 is the exception: packed 4-bit rows (q4_0 groups of 32 with fp16 scales, keys stored after a
+    # fixed Hadamard rotation), 144 bytes per row at head_dim 256 against fp8's 256. Its rows are not
+    # a whole number of bytes per element, so sizes go through row_bytes, never an element size.
     enum KVDtype
       F32
       F16
       FP8
+      Q4
 
-      def elem_bytes : UInt64
+      # Bytes one cached position takes per KV head, in K or V.
+      def row_bytes(head_dim : Int32) : UInt64
         case self
-        in .f32? then 4_u64
-        in .f16? then 2_u64
-        in .fp8? then 1_u64
+        in .f32? then 4_u64 * head_dim
+        in .f16? then 2_u64 * head_dim
+        in .fp8? then 1_u64 * head_dim
+        in .q4?  then (((head_dim // 32) * 2 + 15) // 16 * 16 + head_dim // 2).to_u64
         end
       end
     end
 
     # The KV dtype the environment asks for, downgraded to what the loaded kernels support.
     #
-    # SHAINET_KV_DTYPE=f32|f16|fp8 selects it; without it the older SHAINET_KV_FP16=0 still means
+    # SHAINET_KV_DTYPE=f32|f16|fp8|q4 selects it; without it the older SHAINET_KV_FP16=0 still means
     # fp32, and the default is fp16. One function rather than a per-caller reading so the loader,
     # which sizes the VRAM reserve from it, and every block, which allocates from it, cannot disagree.
     def self.resolve_kv_dtype : KVDtype
       want = case ENV["SHAINET_KV_DTYPE"]?.try(&.downcase)
-             when "fp8", "f8", "e4m3" then KVDtype::FP8
-             when "f16", "fp16"       then KVDtype::F16
-             when "f32", "fp32"       then KVDtype::F32
-             when nil, ""             then ENV.fetch("SHAINET_KV_FP16", "1") == "0" ? KVDtype::F32 : KVDtype::F16
+             when "q4", "q4_0", "int4" then KVDtype::Q4
+             when "fp8", "f8", "e4m3"  then KVDtype::FP8
+             when "f16", "fp16"        then KVDtype::F16
+             when "f32", "fp32"        then KVDtype::F32
+             when nil, ""              then ENV.fetch("SHAINET_KV_FP16", "1") == "0" ? KVDtype::F32 : KVDtype::F16
              else
                Log.warn { "unknown SHAINET_KV_DTYPE=#{ENV["SHAINET_KV_DTYPE"]}; using f16" }
                KVDtype::F16
              end
+      if want.q4? && !(CUDA.kv_q4_kernels_available? && ENV.fetch("SHAINET_SPLIT_ATTN", "1") != "0")
+        # The q4 cache has no single-block attention kernel, so it needs the split path too.
+        Log.warn { "SHAINET_KV_DTYPE=q4 needs the q4 kernels and the split attention path; using fp8" }
+        want = KVDtype::FP8
+      end
       want = KVDtype::F16 if want.fp8? && !CUDA.kv_fp8_kernels_available?
       want = KVDtype::F32 if want.f16? && !CUDA.kv_f16_kernels_available?
       want
@@ -1498,16 +1511,20 @@ module SHAInet
       kv_dtype.fp8?
     end
 
+    def kv_cache_q4? : Bool
+      kv_dtype.q4?
+    end
+
     # Current device footprint of this block's KV cache in bytes (K and V), at
     # the allocated capacity rather than the used length.
     def kv_cache_bytes : UInt64
       return 0_u64 if @gpu_cache_cap == 0
-      2_u64 * @num_kv_heads.to_u64 * @gpu_cache_cap.to_u64 * @head_dim.to_u64 * kv_elem_bytes
+      2_u64 * @num_kv_heads.to_u64 * @gpu_cache_cap.to_u64 * kv_row_bytes
     end
 
-    # Bytes per cache element for the active dtype.
-    private def kv_elem_bytes : UInt64
-      kv_dtype.elem_bytes
+    # Bytes per cached position per KV head for the active dtype.
+    private def kv_row_bytes : UInt64
+      kv_dtype.row_bytes(@head_dim)
     end
 
     # Ensure the device KV cache holds at least total_len positions per
@@ -1537,7 +1554,7 @@ module SHAInet
                   Math.max(256, Math.max(total_len, @gpu_cache_cap * 2))
                 end
 
-      bytes = @num_kv_heads.to_u64 * new_cap.to_u64 * head_dim.to_u64 * kv_elem_bytes
+      bytes = @num_kv_heads.to_u64 * new_cap.to_u64 * kv_row_bytes
       old_k = @gpu_k_cache
       old_v = @gpu_v_cache
       old_cap = @gpu_cache_cap
@@ -1558,11 +1575,11 @@ module SHAInet
       # rows beyond are written by the append kernel immediately after anyway.
       used = Math.min(cached_positions, old_cap)
       if used > 0 && !old_k.null? && !old_v.null?
-        esz = kv_elem_bytes
-        span = used.to_u64 * head_dim.to_u64 * esz
+        rb = kv_row_bytes
+        span = used.to_u64 * rb
         @num_kv_heads.times do |h|
-          dst_off = h.to_u64 * new_cap.to_u64 * head_dim.to_u64 * esz
-          src_off = h.to_u64 * old_cap.to_u64 * head_dim.to_u64 * esz
+          dst_off = h.to_u64 * new_cap.to_u64 * rb
+          src_off = h.to_u64 * old_cap.to_u64 * rb
           CUDA.memcpy((kp.as(Pointer(UInt8)) + dst_off).as(Pointer(Void)),
             (old_k.as(Pointer(UInt8)) + src_off).as(Pointer(Void)),
             span, CUDA::MemcpyKind::DeviceToDevice)
@@ -1651,6 +1668,10 @@ module SHAInet
     # always fp32 and lives at the head of @@gpu_staging.
     private def append_kv(n : Int32, base_pos : Int32)
       case kv_dtype
+      in .q4?
+        CUDA.kv_cache_append_q4(@@gpu_staging, @gpu_k_cache.as(Pointer(UInt8)),
+          @gpu_v_cache.as(Pointer(UInt8)), n, base_pos, @num_kv_heads,
+          @head_dim, @gpu_cache_cap)
       in .fp8?
         CUDA.kv_cache_append_fp8(@@gpu_staging, @gpu_k_cache.as(Pointer(UInt8)),
           @gpu_v_cache.as(Pointer(UInt8)), n, base_pos, @num_kv_heads,
@@ -1740,11 +1761,16 @@ module SHAInet
     # attention layers that is ~104 ms of per-token attention at 14k becoming ~15 ms.
     private def attend_kv(q : Pointer(Float32), n : Int32, base_pos : Int32,
                           heads_per_kv : Int32, scale : Float32)
+      # The q4 cache holds keys rotated by a fixed orthogonal transform, so q gets the same rotation
+      # (q.k is unchanged). In place: q is dead after attention on every path that calls this.
+      CUDA.kv_q4_rotate_q(q, n, @num_heads, @head_dim) if kv_dtype.q4?
+
       # Multi-token chunks (prefill) take the tiled kernel: it reads each K/V row once per 16 queries
       # rather than once per query. It declines shapes it cannot serve, which falls through to the
       # paths below. Its output lands in @@gpu_attn_out like theirs; it does not use the workspace.
       if n > 1 && use_tiled_prefill_attn?
         suffix = case kv_dtype
+                 in .q4?  then "q4"
                  in .fp8? then "fp8"
                  in .f16? then "f16"
                  in .f32? then "f32"
@@ -1761,6 +1787,10 @@ module SHAInet
         attn_ws_floats(n, base_pos + n))
       if use_split_attn?
         ok = case kv_dtype
+             in .q4?
+               CUDA.attention_split_kv_q4(q, @gpu_k_cache.as(Pointer(UInt8)),
+                 @gpu_v_cache.as(Pointer(UInt8)), @@gpu_attn_out, @@gpu_attn_ws,
+                 n, base_pos, @num_heads, heads_per_kv, @head_dim, @gpu_cache_cap, scale)
              in .fp8?
                CUDA.attention_split_kv_fp8(q, @gpu_k_cache.as(Pointer(UInt8)),
                  @gpu_v_cache.as(Pointer(UInt8)), @@gpu_attn_out, @@gpu_attn_ws,
@@ -1782,6 +1812,9 @@ module SHAInet
       end
 
       case kv_dtype
+      in .q4?
+        # resolve_kv_dtype only picks q4 with the split path on, so this is not reachable.
+        raise "the q4 KV cache requires the split attention path"
       in .fp8?
         CUDA.attention_kv_fp8(q, @gpu_k_cache.as(Pointer(UInt8)),
           @gpu_v_cache.as(Pointer(UInt8)), @@gpu_attn_out, @@gpu_attn_ws,

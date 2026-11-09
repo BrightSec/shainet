@@ -103,8 +103,8 @@ module SHAInet
         # as context extends, a 32 MB allocation was observed failing with 333 MB free.
         max_context = (ENV["SHAINET_MAX_CONTEXT"]? || "16384").to_i
         full_attn_layers = types.count { |t| t != "linear_attention" }
-        kv_elem_bytes = LlamaBlock.resolve_kv_dtype.elem_bytes.to_i64
-        kv_per_token = 2_i64 * n_kv_heads * head_dim * kv_elem_bytes * full_attn_layers
+        kv_row_bytes = LlamaBlock.resolve_kv_dtype.row_bytes(head_dim).to_i64
+        kv_per_token = 2_i64 * n_kv_heads * kv_row_bytes * full_attn_layers
         # The attention workspace term depends on which attention path runs. The single-block kernel
         # stages a full score row per query token, n_heads * ATTN_CHUNK * 4 B = 24 KB per token of
         # context, which grows without bound.

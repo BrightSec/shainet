@@ -610,6 +610,10 @@ module SHAInet
     @@attention_kv_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
     @@attention_split_kv_fp8_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
     @@kv_fp8_available : Bool? = nil
+    @@kv_cache_append_q4_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Int32, Int32, Int32, Int32, Int32, Void)?
+    @@kv_q4_rotate_q_proc : Proc(Pointer(Float32), Int32, Int32, Int32, Void)?
+    @@attention_split_kv_q4_proc : Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void)?
+    @@kv_q4_available : Bool? = nil
     @@attention_prefill_procs = {} of String => Proc(Pointer(Float32), Pointer(Void), Pointer(Void), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Int32)?
     @@attention_split_ws_floats_proc : Proc(Int32, Int32, Int32, Int32, Int32)?
 
@@ -2079,6 +2083,55 @@ module SHAInet
       return false unless fn
       fn.call(q, kc, vc, out_ptr, new_tokens, start_pos, num_heads, heads_per_kv, head_dim,
         capacity, scale) != 0
+    end
+
+    # 4-bit KV cache (q4_0 rows, rotated keys). The cache travels as byte pointers; queries must be
+    # rotated with kv_q4_rotate_q before attention. See KVRow<kvq4_t> in cuda_kernels.cu.
+    def kv_cache_append_q4(staging : Pointer(Float32), kc : Pointer(UInt8), vc : Pointer(UInt8),
+                           new_tokens : Int32, start_pos : Int32, num_kv_heads : Int32,
+                           head_dim : Int32, capacity : Int32)
+      unless fn = @@kv_cache_append_q4_proc
+        @@kv_cache_append_q4_proc = fn = load_kernel_proc("kv_cache_append_q4",
+          Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Int32, Int32, Int32, Int32, Int32, Void))
+      end
+      raise "CUDA kernels not available" unless fn
+      fn.call(staging, kc, vc, new_tokens, start_pos, num_kv_heads, head_dim, capacity)
+    end
+
+    def kv_q4_rotate_q(q : Pointer(Float32), rows : Int32, num_heads : Int32, head_dim : Int32)
+      unless fn = @@kv_q4_rotate_q_proc
+        @@kv_q4_rotate_q_proc = fn = load_kernel_proc("kv_q4_rotate_q",
+          Proc(Pointer(Float32), Int32, Int32, Int32, Void))
+      end
+      raise "CUDA kernels not available" unless fn
+      fn.call(q, rows, num_heads, head_dim)
+    end
+
+    def attention_split_kv_q4(q : Pointer(Float32), kc : Pointer(UInt8), vc : Pointer(UInt8),
+                              out_ptr : Pointer(Float32), ws : Pointer(Float32),
+                              new_tokens : Int32, start_pos : Int32, num_heads : Int32,
+                              heads_per_kv : Int32, head_dim : Int32, capacity : Int32,
+                              scale : Float32) : Bool
+      unless fn = @@attention_split_kv_q4_proc
+        @@attention_split_kv_q4_proc = fn = load_kernel_proc("attention_split_kv_q4",
+          Proc(Pointer(Float32), Pointer(UInt8), Pointer(UInt8), Pointer(Float32),
+               Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Int32, Float32, Void))
+      end
+      return false unless fn
+      fn.call(q, kc, vc, out_ptr, ws, new_tokens, start_pos, num_heads,
+        heads_per_kv, head_dim, capacity, scale)
+      true
+    end
+
+    # Whether the loaded kernel library has the q4 KV kernels; a request without them falls back.
+    def kv_q4_kernels_available? : Bool
+      avail = @@kv_q4_available
+      return avail unless avail.nil?
+      result = %w[kv_cache_append_q4 kv_q4_rotate_q attention_split_kv_q4 attention_prefill_q4].all? do |n|
+        !load_kernel_proc(n, Proc(Void)).nil?
+      end
+      @@kv_q4_available = result
+      result
     end
 
     # Whether the loaded kernel library has the fp8 KV kernels. A prebuilt .so from before them

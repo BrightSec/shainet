@@ -20,9 +20,9 @@ require "random/secure"
 #   crystal run examples/openai_server.cr -Denable_cuda -- /path/to/model-dir [port] [host]
 #   crystal run examples/openai_server.cr -Denable_cuda -- /models/Qwen3-Coder-30B-A3B-Instruct
 #
-# Load-time defaults match examples/agent.cr: Q4, MoE offload on, fp8 KV cache, expert cache sized to
-# leave room for the context. Opt out with SHAINET_Q8=1, SHAINET_MOE_OFFLOAD=0, SHAINET_KV_DTYPE=f16,
-# SHAINET_EXPERT_CACHE_MB=<mb>, or SHAINET_FP32=1.
+# Load-time defaults match examples/agent.cr: Q4 weights, MoE offload on, q4 KV cache at a 128K
+# context, expert cache sized to leave room for the context. Opt out with SHAINET_Q8=1,
+# SHAINET_MOE_OFFLOAD=0, SHAINET_KV_DTYPE=fp8|f16, SHAINET_EXPERT_CACHE_MB=<mb>, or SHAINET_FP32=1.
 #
 # SECURITY: this is an example server with NO authentication by default and it
 # binds to 127.0.0.1 (localhost only). Do not expose it to an untrusted network.
@@ -816,9 +816,10 @@ ENV["SHAINET_MOE_OFFLOAD"] = "1" unless ENV.has_key?("SHAINET_MOE_OFFLOAD")
 bits = ENV.fetch("SHAINET_Q8", "0") == "1" ? 8 : 4
 mode = ENV["SHAINET_FP32"]? ? "fp32" : "Q#{bits}"
 offload = ENV.fetch("SHAINET_MOE_OFFLOAD", "0") == "1"
-# fp8 KV cache, as in the agent: at 64K the cache is most of the VRAM reserve, and fp8 halves it versus
-# f16. SHAINET_KV_DTYPE=f16 opts out.
-ENV["SHAINET_KV_DTYPE"] ||= "fp8"
+# q4 KV cache, as in the agent: 4-bit rows with rotated keys, 144 bytes per head per position at
+# head_dim 256 against fp8's 256, which is what lets the default context be 128K. SHAINET_KV_DTYPE=fp8
+# or f16 opts out.
+ENV["SHAINET_KV_DTYPE"] ||= "q4"
 STDERR.puts "  Mode: #{mode}#{offload ? " (MoE offload)" : ""}"
 
 # Decide the context BEFORE loading, and tell the loader.
@@ -829,9 +830,9 @@ STDERR.puts "  Mode: #{mode}#{offload ? " (MoE offload)" : ""}"
 # part-way through a conversation rather than an error at startup. A server is worse off than the
 # agent here, because it will accept whatever prompt a client sends.
 #
-# 65536 by default: this is what the GSQ-RCO model's own authors run (--ctx-size 65536), and on a
-# 16 GB card it still places all 64 layers.
-server_context = (ENV["SHAINET_SERVER_CONTEXT"]? || ENV["SHAINET_MAX_CONTEXT"]? || "65536").to_i
+# 131072 by default, with the q4 cache: on a 16 GB card the 27B still places all 64 layers, and a
+# 127.8K-token prefill completed with 402 MB free. With SHAINET_KV_DTYPE=fp8 use 65536.
+server_context = (ENV["SHAINET_SERVER_CONTEXT"]? || ENV["SHAINET_MAX_CONTEXT"]? || "131072").to_i
 ENV["SHAINET_MAX_CONTEXT"] = server_context.to_s
 STDERR.puts "  Context: #{server_context} tok (KV reserved for this at load)"
 

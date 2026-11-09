@@ -2428,16 +2428,20 @@ STDERR.puts "Loading model from #{model_dir}...".colorize(:dark_gray)
 # reserve was always built for the LOADER's default no matter what the agent went on to permit -- so
 # raising the agent's window silently produced a model with no room for it.
 #
-# 64K is the default because this architecture is built for it (the GGUF declares 262144) and because
-# a 16K window is the difference between an agent that can hold a session and one that compacts every
+# A long default because this architecture is built for it (the GGUF declares 262144) and because a
+# 16K window is the difference between an agent that can hold a session and one that compacts every
 # few turns. The loader places what fits and leaves the rest on the host, so a smaller card degrades
 # in speed rather than failing.
-agent_context = (ENV["SHAINET_AGENT_CONTEXT"]? || "65536").to_i
+#
+# 128K with the q4 KV cache: 4-bit rows with rotated keys take 144 bytes per head per position at
+# head_dim 256 against fp8's 256, so 128K costs 2304 MB, about what fp8 took at 72K. Measured on the
+# 27B on a 16 GB card: all 64 layers stay on the GPU, a 127.8K-token prefill completes with 402 MB
+# free, and four notes hidden at 5-92% depth are all recalled; at 30K the next-token KL against an f16
+# cache is 0.0018 (fp8: 0.0006). SHAINET_KV_DTYPE=fp8 with SHAINET_AGENT_CONTEXT=65536 is the previous
+# setting.
+agent_context = (ENV["SHAINET_AGENT_CONTEXT"]? || "131072").to_i
 ENV["SHAINET_MAX_CONTEXT"] ||= agent_context.to_s
-# fp8 KV cache by default: at 64K the cache is most of the VRAM reserve, and halving it versus fp16
-# frees about 2 GB for roughly eight more resident layers on a 16 GB card -- decode speed the agent
-# feels on every token. SHAINET_KV_DTYPE=f16 opts back out.
-ENV["SHAINET_KV_DTYPE"] ||= "fp8"
+ENV["SHAINET_KV_DTYPE"] ||= "q4"
 # A 30B takes about nine minutes here. Without a progress line that is indistinguishable
 # from a hang, and the layer loop is where nearly all of it goes.
 load_started = Time.monotonic

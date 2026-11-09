@@ -143,6 +143,22 @@ module SHAInet
       raise "CUDA disabled"
     end
 
+    def kv_cache_append_q4(*args)
+      raise "CUDA disabled"
+    end
+
+    def kv_q4_rotate_q(*args)
+      raise "CUDA disabled"
+    end
+
+    def attention_split_kv_q4(*args) : Bool
+      false
+    end
+
+    def kv_q4_kernels_available? : Bool
+      false
+    end
+
     def attention_kv_fp8(*args)
       raise "CUDA disabled"
     end
