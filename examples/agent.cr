@@ -6,6 +6,7 @@ require "./agent_workspace"
 require "./agent_v4a"
 require "./agent_markdown"
 require "./qwen_thinking"
+require "./agent_browser"
 
 # Agentic chat demo: a multi-turn conversation with a growing context and a
 # tool-calling loop, built entirely on Network#run. Think of it as a very light
@@ -984,7 +985,7 @@ module AgentDemo
         result = "#{result.byte_slice(0, MAX_READ_BYTES)}\n... [truncated]" if result.bytesize > MAX_READ_BYTES
         "exit=#{status.exit_code}\n#{result}"
       end,
-    ]
+    ] + browser_tools
   end
 
   # Streams assistant output token-by-token, coloring reasoning (<think>…
