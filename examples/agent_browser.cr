@@ -47,12 +47,10 @@ module AgentDemo
       @ws.on_message { |raw| dispatch(raw) }
       @ws.on_close { |_| fail_pending("the browser connection closed") }
       spawn do
-        begin
-          @ws.run
-        rescue
-        ensure
-          fail_pending("the browser connection ended")
-        end
+        @ws.run
+      rescue
+      ensure
+        fail_pending("the browser connection ended")
       end
     end
 
@@ -228,6 +226,37 @@ module AgentDemo
     @@browser = nil
   end
 
+  # Output under this many bytes is returned inline; anything larger is written to a temp file so a
+  # single big page or query result cannot swamp the model's context.
+  BROWSER_INLINE_LIMIT  = 8_000
+  BROWSER_PREVIEW_BYTES = 2_000
+
+  # Return small browser output inline; for large output, write the full text (header included) to a
+  # temp file and return a short notice plus a head preview, pointing the model at read_file to page
+  # through the rest. `header` is metadata shown inline either way (empty for none); `kind` names the
+  # temp file.
+  def self.deliver_browser_output(header : String, body : String, kind : String) : String
+    full = header.empty? ? body : "#{header}\n\n#{body}"
+    return full if full.bytesize <= BROWSER_INLINE_LIMIT
+
+    path = File.join(Dir.tempdir, "shainet-#{kind}-#{Time.utc.to_unix_ms}.txt")
+    begin
+      File.write(path, full)
+    rescue ex
+      # If the dump fails, fall back to an inline, byte-capped slice rather than losing the output.
+      return "#{full.byte_slice(0, BROWSER_INLINE_LIMIT)}\n... [truncated; could not write temp file: #{ex.message}]"
+    end
+    lines = full.count('\n') + 1
+    String.build do |s|
+      s << header << "\n\n" unless header.empty?
+      s << "[Full output is " << full.bytesize << " bytes (" << lines << " lines), written to " << path
+      s << ".\nRead it with read_file \"" << path << "\" using start_line/end_line ranges; "
+      s << "do not try to read it all at once.]\n\n--- preview (first " << BROWSER_PREVIEW_BYTES << " bytes) ---\n"
+      s << body.byte_slice(0, BROWSER_PREVIEW_BYTES)
+      s << "\n..." if body.bytesize > BROWSER_PREVIEW_BYTES
+    end
+  end
+
   # The browser tools, or none when no Chrome is installed (so the model is not offered a dead tool).
   def self.browser_tools : Array(Tool)
     return [] of Tool unless chrome_path
@@ -237,7 +266,9 @@ module AgentDemo
         "browse",
         "Open a URL in a headless Chrome and return the page's title, final URL and visible text " \
         "(after JavaScript runs). Use this to read web pages, docs or JSON/HTML APIs. http(s) only; " \
-        "the browser keeps its page between calls, so browser_eval afterwards acts on what you opened.",
+        "the browser keeps its page between calls, so browser_eval afterwards acts on what you opened. " \
+        "A large page is written to a temp file and only a preview is returned -- read the file with " \
+        "read_file in line ranges rather than expecting the whole page inline.",
         [ToolParam.new("url", "string", "The http(s) URL to open.")]
       ) do |args|
         url = (args["url"]? || "").strip
@@ -252,10 +283,7 @@ module AgentDemo
           title = b.eval_string("document.title")
           final = b.eval_string("location.href")
           text = b.eval_string("document.body ? document.body.innerText : ''")
-          if text.bytesize > MAX_READ_BYTES
-            text = "#{text.byte_slice(0, MAX_READ_BYTES)}\n... [truncated; use browser_eval to read specific parts]"
-          end
-          "// #{final}\n// title: #{title}\n\n#{text}"
+          AgentDemo.deliver_browser_output("// #{final}\n// title: #{title}", text, "page")
         rescue ex : AgentDemo::BrowserError
           "Error: #{ex.message}"
         end
@@ -265,14 +293,16 @@ module AgentDemo
         "Evaluate a JavaScript expression in the current browser page and return its value as JSON. " \
         "This is how you interact: read the DOM (document.querySelector('h1').innerText), click " \
         "(document.querySelector('#submit').click()), fill a field (el.value='x'), or extract data. " \
-        "Call browse first to load a page. A promise is awaited; the value is returned by value.",
+        "Call browse first to load a page. A promise is awaited; the value is returned by value. " \
+        "A large result is written to a temp file and only a preview is returned -- read the file " \
+        "with read_file in line ranges.",
         [ToolParam.new("expression", "string", "A JavaScript expression; its value is returned.")]
       ) do |args|
         expr = args["expression"]? || ""
         next "Error: empty expression" if expr.empty?
         begin
           result = AgentDemo.browser.eval_json(expr).to_json
-          result.bytesize > MAX_READ_BYTES ? "#{result.byte_slice(0, MAX_READ_BYTES)}\n... [truncated]" : result
+          AgentDemo.deliver_browser_output("", result, "eval")
         rescue ex : AgentDemo::BrowserError
           "Error: #{ex.message}"
         end
