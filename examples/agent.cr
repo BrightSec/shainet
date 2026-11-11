@@ -7,6 +7,7 @@ require "./agent_v4a"
 require "./agent_markdown"
 require "./qwen_thinking"
 require "./agent_browser"
+require "./agent_subagent"
 
 # Agentic chat demo: a multi-turn conversation with a growing context and a
 # tool-calling loop, built entirely on Network#run. Think of it as a very light
@@ -985,7 +986,7 @@ module AgentDemo
         result = "#{result.byte_slice(0, MAX_READ_BYTES)}\n... [truncated]" if result.bytesize > MAX_READ_BYTES
         "exit=#{status.exit_code}\n#{result}"
       end,
-    ] + browser_tools
+    ] + browser_tools + [subagent_tool]
   end
 
   # Streams assistant output token-by-token, coloring reasoning (<think>…
@@ -2172,7 +2173,7 @@ module AgentDemo
           STDERR.puts "  [agent] context compacted (−#{removed} tokens)" if removed > 0
         end
 
-        STDERR.print "\n#{"Agent".colorize(:light_cyan).bold} ❯ "
+        STDERR.print "\n#{@label.colorize(@depth > 0 ? :light_magenta : :light_cyan).bold} ❯ "
         STDERR.flush
         begin
           text, text_ids = generate # streams the filtered prose inline
@@ -2306,7 +2307,9 @@ module AgentDemo
 
           tool = @tools.find { |t| t.name == c.name }
           result =
-            if tool
+            if c.name == AgentDemo::SUBAGENT_TOOL
+              run_subagent(c.args)
+            elsif tool
               begin
                 tool.call(c.args)
               rescue ex

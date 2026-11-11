@@ -207,6 +207,92 @@ module SHAInet
       @cache_len = positions
     end
 
+    # A host copy of this block's whole KV cache, so the cache can be put back after something else
+    # has used it. truncate_cache! can only rewind to a point whose rows are still there; this survives
+    # the rows being overwritten by a different sequence in between.
+    class KVSnapshot
+      getter positions : Int32
+      getter? host_stale : Bool
+      getter host_k : Array(Array(Float32))
+      getter host_v : Array(Array(Float32))
+      # Device rows, head-major and packed (no capacity stride): num_kv_heads * rows * row_bytes.
+      getter dev_k : Bytes?
+      getter dev_v : Bytes?
+      getter dev_rows : Int32
+      getter row_bytes : UInt64
+
+      def initialize(@positions, @host_stale, @host_k, @host_v, @dev_k, @dev_v, @dev_rows, @row_bytes)
+      end
+
+      def bytes : Int64
+        total = 0_i64
+        {@host_k, @host_v}.each { |c| c.each { |a| total += a.size.to_i64 * 4 } }
+        @dev_k.try { |b| total += b.size }
+        @dev_v.try { |b| total += b.size }
+        total
+      end
+    end
+
+    def snapshot_kv : KVSnapshot
+      dev_k = dev_v = nil
+      rows = 0
+      rb = kv_row_bytes
+      if @gpu_cache_cap > 0 && !@gpu_k_cache.null? && !@gpu_v_cache.null?
+        rows = Math.min(cached_positions, @gpu_cache_cap)
+        if rows > 0
+          CUDA.device_synchronize
+          span = rows.to_u64 * rb
+          k = Bytes.new(span * @num_kv_heads)
+          v = Bytes.new(span * @num_kv_heads)
+          @num_kv_heads.times do |h|
+            src = h.to_u64 * @gpu_cache_cap.to_u64 * rb
+            dst = h.to_u64 * span
+            copy_kv_rows((k.to_unsafe + dst).as(Pointer(Void)), (@gpu_k_cache.as(Pointer(UInt8)) + src).as(Pointer(Void)),
+              span, CUDA::MemcpyKind::DeviceToHost)
+            copy_kv_rows((v.to_unsafe + dst).as(Pointer(Void)), (@gpu_v_cache.as(Pointer(UInt8)) + src).as(Pointer(Void)),
+              span, CUDA::MemcpyKind::DeviceToHost)
+          end
+          dev_k, dev_v = k, v
+        end
+      end
+      KVSnapshot.new(cached_positions, @host_kv_stale, @k_cache.map(&.dup), @v_cache.map(&.dup),
+        dev_k, dev_v, rows, rb)
+    end
+
+    # Put a snapshot back. Returns false, changing nothing, when the device cache can no longer hold
+    # it (smaller capacity, or a different row format); the caller then clears and prefills instead.
+    def restore_kv!(snap : KVSnapshot) : Bool
+      return false unless can_restore_kv?(snap)
+      if (k = snap.dev_k) && (v = snap.dev_v)
+        span = snap.dev_rows.to_u64 * snap.row_bytes
+        @num_kv_heads.times do |h|
+          dst = h.to_u64 * @gpu_cache_cap.to_u64 * snap.row_bytes
+          src = h.to_u64 * span
+          copy_kv_rows((@gpu_k_cache.as(Pointer(UInt8)) + dst).as(Pointer(Void)), (k.to_unsafe + src).as(Pointer(Void)),
+            span, CUDA::MemcpyKind::HostToDevice)
+          copy_kv_rows((@gpu_v_cache.as(Pointer(UInt8)) + dst).as(Pointer(Void)), (v.to_unsafe + src).as(Pointer(Void)),
+            span, CUDA::MemcpyKind::HostToDevice)
+        end
+      end
+      @k_cache = snap.host_k.map(&.dup)
+      @v_cache = snap.host_v.map(&.dup)
+      @host_cache_reserved = false
+      @host_kv_stale = snap.host_stale?
+      @cache_len = snap.positions
+      true
+    end
+
+    def can_restore_kv?(snap : KVSnapshot) : Bool
+      return true unless snap.dev_k && snap.dev_v
+      snap.row_bytes == kv_row_bytes && @gpu_cache_cap >= snap.dev_rows &&
+        !@gpu_k_cache.null? && !@gpu_v_cache.null?
+    end
+
+    private def copy_kv_rows(dst : Pointer(Void), src : Pointer(Void), bytes : UInt64, kind : CUDA::MemcpyKind)
+      r = CUDA.memcpy(dst, src, bytes, kind)
+      raise "KV snapshot copy failed (#{r})" unless r.nil? || r == 0
+    end
+
     def finalize
       # Only free the per-instance KV cache; the attention scratch is class-level
       # and shared across all blocks, so it must not be freed per instance.

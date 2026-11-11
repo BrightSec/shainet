@@ -259,3 +259,107 @@ describe "cache rewind on the device paths" do
     end
   end
 end
+
+# A snapshot parks one sequence while the cache is cleared and used for a DIFFERENT sequence, then
+# resumes it. truncate_cache!/save_cache! cannot do that: the other sequence overwrites the rows.
+describe "Network#snapshot_cache / #restore_cache_snapshot!" do
+  it "resumes a parked sequence after another one used the cache" do
+    net = SHAInet::Network.new
+    net.add_layer("llama", 16, num_heads: 4, ff_hidden: 32, num_kv_heads: 2, head_dim: 4)
+    net.add_layer("gated_deltanet", 16, num_heads: 4, ff_hidden: 32, num_kv_heads: 2, head_dim: 4)
+    llama = net.hidden_layers.find!(&.is_a?(SHAInet::LlamaBlock)).as(SHAInet::LlamaBlock)
+    llama.w_q = seeded(16, 16, 1.0)
+    llama.w_k = seeded(16, 8, 2.0)
+    llama.w_v = seeded(16, 8, 3.0)
+    llama.w_o = seeded(16, 16, 4.0)
+    gdn = net.hidden_layers.find!(&.is_a?(SHAInet::GatedDeltaNetBlock)).as(SHAInet::GatedDeltaNetBlock)
+    [gdn.w_q.as(SHAInet::SimpleMatrix), gdn.w_k.as(SHAInet::SimpleMatrix),
+     gdn.w_v.as(SHAInet::SimpleMatrix), gdn.w_o.as(SHAInet::SimpleMatrix),
+     gdn.w_gate.as(SHAInet::SimpleMatrix), gdn.w_alpha, gdn.w_beta,
+     gdn.conv_q.weight, gdn.conv_k.weight, gdn.conv_v.weight].each_with_index do |m, idx|
+      m.rows.times { |i| m.cols.times { |j| m[i, j] = 0.08 * Math.sin((i * 7 + j * 13 + idx * 3) * 0.37) } }
+    end
+
+    a, other, c = seeded(5, 16, 0.1), seeded(7, 16, 0.6), seeded(3, 16, 1.3)
+    step = ->(x : SHAInet::SimpleMatrix) { {llama.forward_cached(x), gdn.forward(x)} }
+
+    net.clear_cache!
+    step.call(a)
+    snap = net.snapshot_cache
+    snap.bytes.should be > 0
+
+    # A different sequence takes over the cache.
+    net.clear_cache!
+    step.call(other)
+    llama.cached_length.should eq(7)
+
+    net.restore_cache_snapshot!(snap).should be_true
+    llama.cached_length.should eq(5)
+    resumed_attn, resumed_gdn = step.call(c)
+
+    net.clear_cache!
+    step.call(a)
+    want_attn, want_gdn = step.call(c)
+    max_diff(resumed_attn, want_attn).should be < 1e-5
+    max_diff(resumed_gdn, want_gdn).should be < 1e-6
+
+    # Counter-check: continuing from the other sequence instead gives a different result.
+    net.clear_cache!
+    step.call(other)
+    dirty_attn, dirty_gdn = step.call(c)
+    max_diff(dirty_attn, want_attn).should be > 1e-4
+    max_diff(dirty_gdn, want_gdn).should be > 1e-6
+
+    # The snapshot is not consumed: it can be restored again.
+    net.restore_cache_snapshot!(snap).should be_true
+    llama.cached_length.should eq(5)
+  end
+
+  it "parks a device-resident q4 KV cache", tags: "cuda" do
+    pending! "no CUDA" unless SHAInet::CUDA.fully_available?
+    pending! "no q4 kernels" unless SHAInet::CUDA.prefill_attn_kernels_available? &&
+                                    SHAInet::CUDA.kv_q4_kernels_available?
+
+    prev = SHAInet::LlamaBlock.prefill_attn_device_enabled?
+    prev_dtype = ENV["SHAINET_KV_DTYPE"]?
+    SHAInet::LlamaBlock.prefill_attn_device_enabled = true
+    ENV["SHAINET_KV_DTYPE"] = "q4"
+    begin
+      build = -> do
+        blk = SHAInet::LlamaBlock.new(64, 4, 128, num_kv_heads: 2, head_dim: 32)
+        blk.w_q = seeded(64, 128, 1.0)
+        blk.w_k = seeded(64, 64, 2.0)
+        blk.w_v = seeded(64, 64, 3.0)
+        blk.w_o = seeded(128, 64, 4.0)
+        blk.to_gpu!(quantize: true, bits: 4)
+        blk.kv_max_context = 64
+        blk.clear_cache!
+        blk
+      end
+      a, other, c = seeded(6, 64, 0.1), seeded(9, 64, 0.7), seeded(3, 64, 1.3)
+
+      blk = build.call
+      blk.kv_cache_q4?.should be_true
+      blk.forward_cached(a)
+      blk.host_kv_stale?.should be_true
+      snap = blk.snapshot_kv
+      blk.clear_cache!
+      blk.forward_cached(other)
+      blk.restore_kv!(snap).should be_true
+      blk.cached_length.should eq(6)
+      resumed = blk.forward_cached(c)
+
+      fresh = build.call
+      fresh.forward_cached(a)
+      expected = fresh.forward_cached(c)
+      max_diff(resumed, expected).should be < 1e-3
+
+      dirty = build.call
+      dirty.forward_cached(other)
+      max_diff(dirty.forward_cached(c), expected).should be > 1e-3
+    ensure
+      SHAInet::LlamaBlock.prefill_attn_device_enabled = prev
+      prev_dtype ? (ENV["SHAINET_KV_DTYPE"] = prev_dtype) : ENV.delete("SHAINET_KV_DTYPE")
+    end
+  end
+end

@@ -174,36 +174,77 @@ module SHAInet
       end
     end
 
-    # One saved copy of the recurrent state, for rewinding a sequence to the point it was taken.
+    # A copy of the recurrent state at one position, for rewinding a sequence to that point.
     #
     # Recurrent state cannot be truncated the way a KV cache can: every token is folded into it, so
     # the only way back to an earlier position is a copy made at that position. Device state is copied
-    # to HOST memory, so the copy costs no VRAM, and the buffers are reused between saves.
+    # to HOST memory, so a snapshot costs no VRAM.
+    class StateSnapshot
+      property state = [] of SimpleMatrix?
+      property conv_q : SimpleMatrix? = nil
+      property conv_k : SimpleMatrix? = nil
+      property conv_v : SimpleMatrix? = nil
+      # nil when the block had no device state at the snapshot point.
+      property dev_state : Bytes? = nil
+      property conv_devs = {} of Symbol => Bytes
+
+      def bytes : Int64
+        total = 0_i64
+        @dev_state.try { |b| total += b.size }
+        @conv_devs.each_value { |b| total += b.size }
+        total
+      end
+    end
+
+    # Copy the current recurrent state (host and device) into a snapshot. `reuse` lends its device
+    # buffers when the shapes still match, so repeated saves into the same slot do not reallocate.
+    def snapshot_state(reuse : StateSnapshot? = nil) : StateSnapshot
+      snap = reuse || StateSnapshot.new
+      snap.state = @state.map(&.try(&.clone))
+      snap.conv_q = @conv_state_q.try(&.clone)
+      snap.conv_k = @conv_state_k.try(&.clone)
+      snap.conv_v = @conv_state_v.try(&.clone)
+      snap.dev_state = (m = @dev_state) ? GatedDeltaNetBlock.device_to_host(m, snap.dev_state) : nil
+      snap.conv_devs.select! { |role, _| @conv_state_devs.has_key?(role) }
+      @conv_state_devs.each do |role, m|
+        snap.conv_devs[role] = GatedDeltaNetBlock.device_to_host(m, snap.conv_devs[role]?)
+      end
+      snap
+    end
+
+    # Replace the current state with a snapshot's. The snapshot is not consumed, so the same point
+    # can be restored again.
+    def restore_state!(snap : StateSnapshot) : Nil
+      @num_v_heads.times { |h| @state[h] = snap.state[h]?.try(&.clone) }
+      @conv_state_q = snap.conv_q.try(&.clone)
+      @conv_state_k = snap.conv_k.try(&.clone)
+      @conv_state_v = snap.conv_v.try(&.clone)
+      # Device buffers are written in place: same shapes every time, so no reallocation per request.
+      if bytes = snap.dev_state
+        GatedDeltaNetBlock.host_to_device(device_state, bytes)
+      else
+        @dev_state.try(&.free!)
+        @dev_state = nil
+      end
+      @conv_state_devs.each do |role, m|
+        if bytes = snap.conv_devs[role]?
+          GatedDeltaNetBlock.host_to_device(m, bytes)
+        else
+          # Created after the snapshot, so at that point it did not exist yet: fresh means zero.
+          m.zero!
+          m.mark_host_modified!
+          m.sync_to_device!("gdn_conv_state_restore")
+        end
+      end
+    end
+
+    # This block's single save slot, used by Network#save_cache! / #restore_cache!.
+    @saved_snapshot : StateSnapshot? = nil
     @saved = false
-    @saved_state = [] of SimpleMatrix?
-    @saved_conv_q : SimpleMatrix?
-    @saved_conv_k : SimpleMatrix?
-    @saved_conv_v : SimpleMatrix?
-    @saved_dev_state : Bytes?
-    @saved_dev_present = false
-    @saved_conv_devs = {} of Symbol => Bytes
 
     # Save the current recurrent state (host and device) into this block's single save slot.
     def save_state!
-      @saved_state = @state.map(&.try(&.clone))
-      @saved_conv_q = @conv_state_q.try(&.clone)
-      @saved_conv_k = @conv_state_k.try(&.clone)
-      @saved_conv_v = @conv_state_v.try(&.clone)
-      if m = @dev_state
-        @saved_dev_state = GatedDeltaNetBlock.device_to_host(m, @saved_dev_state)
-        @saved_dev_present = true
-      else
-        @saved_dev_present = false
-      end
-      @saved_conv_devs.select! { |role, _| @conv_state_devs.has_key?(role) }
-      @conv_state_devs.each do |role, m|
-        @saved_conv_devs[role] = GatedDeltaNetBlock.device_to_host(m, @saved_conv_devs[role]?)
-      end
+      @saved_snapshot = snapshot_state(@saved_snapshot)
       @saved = true
     end
 
@@ -211,27 +252,9 @@ module SHAInet
     # saved. The slot is kept, so the same point can be restored again.
     def restore_saved_state! : Bool
       return false unless @saved
-      @num_v_heads.times { |h| @state[h] = @saved_state[h]?.try(&.clone) }
-      @conv_state_q = @saved_conv_q.try(&.clone)
-      @conv_state_k = @saved_conv_k.try(&.clone)
-      @conv_state_v = @saved_conv_v.try(&.clone)
-      # Device buffers are written in place: same shapes every time, so no reallocation per request.
-      if @saved_dev_present && (bytes = @saved_dev_state)
-        GatedDeltaNetBlock.host_to_device(device_state, bytes)
-      else
-        @dev_state.try(&.free!)
-        @dev_state = nil
-      end
-      @conv_state_devs.each do |role, m|
-        if bytes = @saved_conv_devs[role]?
-          GatedDeltaNetBlock.host_to_device(m, bytes)
-        else
-          # Created after the save, so at the saved point it did not exist yet: fresh means zero.
-          m.zero!
-          m.mark_host_modified!
-          m.sync_to_device!("gdn_conv_state_restore")
-        end
-      end
+      snap = @saved_snapshot
+      return false unless snap
+      restore_state!(snap)
       true
     end
 

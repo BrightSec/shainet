@@ -245,6 +245,40 @@ module SHAInet
       gdn_cache_blocks.each(&.drop_saved_state!)
     end
 
+    # The whole sequence state of the network (every KV cache and every recurrent state), copied to
+    # host memory. Unlike save_cache!, which can only rewind while the cached rows are untouched, a
+    # snapshot survives the cache being cleared and used for a different sequence in between: that
+    # is what lets one conversation be parked while another runs, then resumed without a re-prefill.
+    class CacheSnapshot
+      getter kv : Array(LlamaBlock::KVSnapshot)
+      getter gdn : Array(GatedDeltaNetBlock::StateSnapshot)
+
+      def initialize(@kv, @gdn)
+      end
+
+      def bytes : Int64
+        kv.sum(&.bytes) + gdn.sum(&.bytes)
+      end
+    end
+
+    def snapshot_cache : CacheSnapshot
+      CUDA.device_synchronize if CUDA.fully_available?
+      CacheSnapshot.new(llama_cache_blocks.map(&.snapshot_kv), gdn_cache_blocks.map(&.snapshot_state))
+    end
+
+    # Put a snapshot back. All or nothing: returns false, changing nothing, when any block can no
+    # longer hold its part (the caller then clears the cache and prefills from scratch).
+    def restore_cache_snapshot!(snap : CacheSnapshot) : Bool
+      blocks = llama_cache_blocks
+      gdns = gdn_cache_blocks
+      return false unless blocks.size == snap.kv.size && gdns.size == snap.gdn.size
+      return false unless blocks.each_with_index.all? { |b, i| b.can_restore_kv?(snap.kv[i]) }
+      blocks.each_with_index { |b, i| b.restore_kv!(snap.kv[i]) }
+      gdns.each_with_index { |g, i| g.restore_state!(snap.gdn[i]) }
+      CUDA.device_synchronize if CUDA.fully_available?
+      true
+    end
+
     private def llama_cache_blocks : Array(LlamaBlock)
       @transformer_layers.compact_map { |l| l.as(LlamaBlock) if l.is_a?(LlamaBlock) }
     end
