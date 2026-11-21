@@ -1875,23 +1875,28 @@ template <typename KV, int D>
 __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc, const KV* __restrict__ vc,
     float* __restrict__ part_out, float* __restrict__ part_max, float* __restrict__ part_sum,
-    int start_pos, int num_heads, int hpk, int capacity, float scale, int num_splits) {
+    int start_pos, int num_heads, int hpk, int capacity, float scale, int num_splits, int new_tokens) {
     __shared__ float sc[DGQA_MAX_HPK][ATTN_SPLIT_SCORES];
     __shared__ float red[DGQA_THREADS / D][DGQA_MAX_HPK][D];
-    const int kvh = blockIdx.x, sp = blockIdx.y;
+    // Several query tokens (a speculative verify pass) go one per blockIdx.z: token t sees
+    // start_pos + t + 1 keys (causal), and its partials sit at (head * new_tokens + t) * splits like
+    // attention_split_kv_kernel's. Walking the tokens inside one block instead (K/V from L1 after the
+    // first) measured slower at 32K context, 25.5 against 22.5 ms for 4 tokens over 16 layers.
+    const int kvh = blockIdx.x, sp = blockIdx.y, tq = blockIdx.z;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int visible = start_pos + 1;
-    const int j0 = sp * ATTN_SPLIT_SCORES;
-    const int j1 = min(j0 + ATTN_SPLIT_SCORES, visible);
     const int h0 = kvh * hpk;
     constexpr int RB = KVRow<KV>::bytes(D);
     const unsigned char* kh = kv_row(kc, kvh, 0, capacity, D);
     const unsigned char* vh = kv_row(vc, kvh, 0, capacity, D);
+    const float* qt = q + (long)tq * num_heads * D;
+    const int visible = start_pos + tq + 1;
+    const int j0 = sp * ATTN_SPLIT_SCORES;
+    const int j1 = min(j0 + ATTN_SPLIT_SCORES, visible);
 
     if (j0 >= j1) {   // empty split: the combine's identity (max -inf, sum 0, zero partial)
         for (int i = tid; i < hpk * D; i += DGQA_THREADS) {
             const int hl = i / D, d = i - hl * D;
-            const long pidx = (long)(h0 + hl) * num_splits + sp;
+            const long pidx = ((long)(h0 + hl) * new_tokens + tq) * num_splits + sp;
             part_out[pidx * D + d] = 0.0f;
             if (d == 0) { part_max[pidx] = -INFINITY; part_sum[pidx] = 0.0f; }
         }
@@ -1906,7 +1911,7 @@ __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
     for (int hl = 0; hl < DGQA_MAX_HPK; ++hl)
         #pragma unroll
         for (int e = 0; e < DPL; ++e)
-            qr[hl][e] = (hl < hpk) ? q[(long)(h0 + hl) * D + lane * DPL + e] : 0.0f;
+            qr[hl][e] = (hl < hpk) ? qt[(long)(h0 + hl) * D + lane * DPL + e] : 0.0f;
 
     for (int j = j0 + warp; j < j1; j += DGQA_THREADS / 32) {
         float kf[8];
@@ -1952,7 +1957,7 @@ __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xFFFFFFFF, sum, o);
         if (lane == 0) {
-            const long pidx = (long)(h0 + hl) * num_splits + sp;
+            const long pidx = ((long)(h0 + hl) * new_tokens + tq) * num_splits + sp;
             part_max[pidx] = m;
             part_sum[pidx] = sum;
         }
@@ -1983,7 +1988,7 @@ __global__ void __launch_bounds__(DGQA_THREADS) attention_decode_gqa_kernel(
     }
     if (grp == 0)
         for (int hl = 0; hl < hpk; ++hl)
-            part_out[((long)(h0 + hl) * num_splits + sp) * D + d] = acc[hl];
+            part_out[(((long)(h0 + hl) * new_tokens + tq) * num_splits + sp) * D + d] = acc[hl];
 }
 
 // 1 when the grouped kernel took the call (one token, head_dim 128/256, at most 8 query heads per KV
@@ -1992,21 +1997,21 @@ template <typename KV>
 static int attention_decode_gqa_launch(const float* q, const KV* kc, const KV* vc,
                                        float* part_out, float* part_max, float* part_sum,
                                        int start_pos, int num_heads, int heads_per_kv, int head_dim,
-                                       int capacity, float scale, int splits) {
+                                       int capacity, float scale, int splits, int new_tokens) {
     static const bool enabled = [] {
         const char* e = getenv("SHAINET_DECODE_GQA_ATTN");
         return !(e && e[0] == '0');
     }();
     if (!enabled || heads_per_kv > DGQA_MAX_HPK || num_heads % heads_per_kv != 0) return 0;
-    dim3 grid(num_heads / heads_per_kv, splits);
+    dim3 grid(num_heads / heads_per_kv, splits, new_tokens);
     switch (head_dim) {
     case 256:
         attention_decode_gqa_kernel<KV, 256><<<grid, DGQA_THREADS>>>(q, kc, vc, part_out, part_max, part_sum,
-            start_pos, num_heads, heads_per_kv, capacity, scale, splits);
+            start_pos, num_heads, heads_per_kv, capacity, scale, splits, new_tokens);
         return 1;
     case 128:
         attention_decode_gqa_kernel<KV, 128><<<grid, DGQA_THREADS>>>(q, kc, vc, part_out, part_max, part_sum,
-            start_pos, num_heads, heads_per_kv, capacity, scale, splits);
+            start_pos, num_heads, heads_per_kv, capacity, scale, splits, new_tokens);
         return 1;
     default:
         return 0;
@@ -2014,7 +2019,7 @@ static int attention_decode_gqa_launch(const float* q, const KV* kc, const KV* v
 }
 template <>
 int attention_decode_gqa_launch<float>(const float*, const float*, const float*, float*, float*, float*,
-                                       int, int, int, int, int, float, int) {
+                                       int, int, int, int, int, float, int, int) {
     return 0;   // the f32 cache keeps the per-head kernel
 }
 
@@ -2033,9 +2038,12 @@ static void attention_split_kv_launch(const float* q, const KV* kc, const KV* vc
     float* part_sum = part_max + n_part;
 
     const int threads = 128;
-    const bool grouped = new_tokens == 1 &&
+    // Up to GEMV_MR_MAX_ROWS tokens (a speculative verify pass) also take the grouped kernel: the
+    // per-head kernel reads K/V once per query head, and the tiled prefill kernel, sized for 64-query
+    // tiles, ran 4 tokens at 32K context in 70 ms against 7 ms for one decode token.
+    const bool grouped = new_tokens <= 8 &&
         attention_decode_gqa_launch<KV>(q, kc, vc, part_out, part_max, part_sum, start_pos, num_heads,
-                                        heads_per_kv, head_dim, capacity, scale, splits);
+                                        heads_per_kv, head_dim, capacity, scale, splits, new_tokens);
     if (!grouped) {
         dim3 grid(num_heads, new_tokens, splits);
         size_t shmem = (head_dim + ATTN_SPLIT_SCORES + threads) * sizeof(float);
