@@ -149,6 +149,7 @@ module SHAInet
     # behind would let the first positions of a new sequence see the tail of the previous one,
     # which is a silent correctness bug rather than a visible failure.
     def clear_cache!
+      @verify_rows = 0
       @num_v_heads.times { |h| @state[h] = nil }
       @conv_state_q = nil
       @conv_state_k = nil
@@ -261,6 +262,68 @@ module SHAInet
     # Forget the saved state.
     def drop_saved_state!
       @saved = false
+    end
+
+    # ── Speculative verify ──
+    #
+    # A verify pass runs the last committed token plus k drafted ones, and only afterwards learns how
+    # many of them to keep. A KV cache handles that by truncation; recurrent state cannot be cut back.
+    # So while `verify` is on, the mixer leaves the recurrent state and the conv windows exactly as
+    # they were and keeps each row's recurrence inputs (pre-conv q/k/v, post-conv q/k/v, the gates)
+    # in this block's own buffers. commit_verify!(n) then folds the first n rows into the state with
+    # the same kernels a normal pass uses, so the result is the state those n tokens would have left
+    # -- without a copy of the state, and without re-running the projections. FreeToken does the same
+    # (LinearVerifyScratch); the alternative, snapshot + re-run the accepted tokens, costs a whole
+    # extra forward pass on every partial accept.
+    @@verify = false
+
+    def self.verify? : Bool
+      @@verify
+    end
+
+    def self.verify=(value : Bool)
+      @@verify = value
+    end
+
+    # Rows the last verify pass left uncommitted (0 when there is nothing pending).
+    getter verify_rows : Int32 = 0
+    @verify_bufs = {} of Symbol => CudaMatrix
+
+    # This block's own buffer for `role` during a verify pass (the shared resident buffers are
+    # overwritten by the next block).
+    private def verify_buf(role : Symbol, rows : Int32, cols : Int32) : CudaMatrix
+      if existing = @verify_bufs[role]?
+        return existing if existing.rows == rows && existing.cols == cols
+        existing.free!
+      end
+      @verify_bufs[role] = CudaMatrix.new(rows, cols)
+    end
+
+    # Fold the first `rows` rows of the pending verify pass into the recurrent state and conv
+    # windows, and drop the rest.
+    def commit_verify!(rows : Int32) : Nil
+      pending = @verify_rows
+      @verify_rows = 0
+      return if pending == 0
+      raise ArgumentError.new("commit_verify!(#{rows}) but the verify pass ran #{pending} rows") if rows > pending
+      return if rows <= 0
+      k_dim = @num_k_heads * @head_k
+      v_dim = @num_v_heads * @head_v
+      qd = @verify_bufs[:qd]
+      kd = @verify_bufs[:kd]
+      vd = @verify_bufs[:vd]
+      ok = CUDA.short_conv_state3(conv_state_dev(:q, k_dim), qd.device_ptr.not_nil!,
+        conv_state_dev(:k, k_dim), kd.device_ptr.not_nil!,
+        conv_state_dev(:v, v_dim), vd.device_ptr.not_nil!,
+        rows, k_dim, k_dim, v_dim, @conv_kernel)
+      raise "short_conv_state3 unavailable" unless ok
+      CUDA.gated_delta_rule(
+        @verify_bufs[:qc].device_ptr.not_nil!, @verify_bufs[:kc].device_ptr.not_nil!,
+        @verify_bufs[:vc].device_ptr.not_nil!,
+        @verify_bufs[:ad].device_ptr.not_nil!, @verify_bufs[:bd].device_ptr.not_nil!,
+        device_state.device_ptr.not_nil!, @verify_bufs[:od].device_ptr.not_nil!,
+        rows, @num_v_heads, @num_k_heads, @head_k, @head_v, @num_v_heads // @num_k_heads,
+        (1.0 / Math.sqrt(@head_k.to_f64)).to_f32, @k_head_tiled)
     end
 
     # Copy a device matrix's float32 contents into `buf` (reused when it is the right size).
@@ -394,10 +457,13 @@ module SHAInet
       seq = xd.rows
       k_dim = @num_k_heads * @head_k
       v_dim = @num_v_heads * @head_v
+      verify = @@verify
+      raise "a verify pass needs the fused conv kernels" if verify && !CUDA.gdn_verify_kernels_available?
+      buf = ->(role : Symbol, rows : Int32, cols : Int32) { verify ? verify_buf(role, rows, cols) : resident_buf(role, rows, cols) }
 
-      qd = resident_buf(:q, seq, k_dim)
-      kd = resident_buf(:k, seq, k_dim)
-      vd = resident_buf(:v, seq, v_dim)
+      qd = buf.call(:qd, seq, k_dim)
+      kd = buf.call(:kd, seq, k_dim)
+      vd = buf.call(:vd, seq, v_dim)
       gd = resident_buf(:gd, seq, v_dim)
       # All four projections read xd, so they share one int8 quantization of it. The output gate
       # (gd) is only consumed at the end of the mixer, but computing it here is the same product
@@ -409,20 +475,32 @@ module SHAInet
         wg.gemv_into(xd, gd)
       end
 
-      qc = resident_buf(:qc, seq, k_dim)
-      kc = resident_buf(:kc, seq, k_dim)
-      vc = resident_buf(:vc, seq, v_dim)
+      qc = buf.call(:qc, seq, k_dim)
+      kc = buf.call(:kc, seq, k_dim)
+      vc = buf.call(:vc, seq, v_dim)
       # Nine launches (three conv, three state rolls, three SiLU) collapse to two when the fused
       # kernel is present. SiLU is written in mul_sigmoid's exact form inside the conv, so the
       # numbers do not move; the unfused path below stays as the fallback.
-      fused = CUDA.short_conv_silu3(
-        qc.device_ptr.not_nil!, qd.device_ptr.not_nil!,
-        conv_state_dev(:q, k_dim), conv_weight_dev(:q, @conv_q),
-        kc.device_ptr.not_nil!, kd.device_ptr.not_nil!,
-        conv_state_dev(:k, k_dim), conv_weight_dev(:k, @conv_k),
-        vc.device_ptr.not_nil!, vd.device_ptr.not_nil!,
-        conv_state_dev(:v, v_dim), conv_weight_dev(:v, @conv_v),
-        seq, k_dim, k_dim, v_dim, @conv_kernel, true)
+      fused = if verify
+                # The conv windows stay at the pre-verify point; commit_verify! rolls them.
+                CUDA.short_conv_silu3_nostate(
+                  qc.device_ptr.not_nil!, qd.device_ptr.not_nil!,
+                  conv_state_dev(:q, k_dim), conv_weight_dev(:q, @conv_q),
+                  kc.device_ptr.not_nil!, kd.device_ptr.not_nil!,
+                  conv_state_dev(:k, k_dim), conv_weight_dev(:k, @conv_k),
+                  vc.device_ptr.not_nil!, vd.device_ptr.not_nil!,
+                  conv_state_dev(:v, v_dim), conv_weight_dev(:v, @conv_v),
+                  seq, k_dim, k_dim, v_dim, @conv_kernel, true)
+              else
+                CUDA.short_conv_silu3(
+                  qc.device_ptr.not_nil!, qd.device_ptr.not_nil!,
+                  conv_state_dev(:q, k_dim), conv_weight_dev(:q, @conv_q),
+                  kc.device_ptr.not_nil!, kd.device_ptr.not_nil!,
+                  conv_state_dev(:k, k_dim), conv_weight_dev(:k, @conv_k),
+                  vc.device_ptr.not_nil!, vd.device_ptr.not_nil!,
+                  conv_state_dev(:v, v_dim), conv_weight_dev(:v, @conv_v),
+                  seq, k_dim, k_dim, v_dim, @conv_kernel, true)
+              end
       unless fused
         CUDA.short_conv(qc.device_ptr.not_nil!, qd.device_ptr.not_nil!,
           conv_state_dev(:q, k_dim), conv_weight_dev(:q, @conv_q), seq, k_dim, @conv_kernel)
@@ -456,20 +534,31 @@ module SHAInet
         CUDA.gemm(h, wb.device_ptr.not_nil!, xd.device_ptr.not_nil!,
           bp.device_ptr.not_nil!, @num_v_heads, seq, @d_model, @num_v_heads, @d_model, @num_v_heads)
       end
-      ad = resident_buf(:ad, seq, @num_v_heads)
-      bd = resident_buf(:bd, seq, @num_v_heads)
+      ad = buf.call(:ad, seq, @num_v_heads)
+      bd = buf.call(:bd, seq, @num_v_heads)
       CUDA.gdn_gates(ad.device_ptr.not_nil!, bd.device_ptr.not_nil!,
         ap.device_ptr.not_nil!, bp.device_ptr.not_nil!,
         gate_param_dev(:a_log, @a_log), gate_param_dev(:dt_bias, @dt_bias),
         seq, @num_v_heads)
 
-      od = resident_buf(:od, seq, v_dim)
-      CUDA.gated_delta_rule(
-        qc.device_ptr.not_nil!, kc.device_ptr.not_nil!, vc.device_ptr.not_nil!,
-        ad.device_ptr.not_nil!, bd.device_ptr.not_nil!,
-        device_state.device_ptr.not_nil!, od.device_ptr.not_nil!,
-        seq, @num_v_heads, @num_k_heads, @head_k, @head_v, @num_v_heads // @num_k_heads,
-        (1.0 / Math.sqrt(@head_k.to_f64)).to_f32, @k_head_tiled)
+      od = buf.call(:od, seq, v_dim)
+      if verify
+        ok = CUDA.gated_delta_rule_nowrite(
+          qc.device_ptr.not_nil!, kc.device_ptr.not_nil!, vc.device_ptr.not_nil!,
+          ad.device_ptr.not_nil!, bd.device_ptr.not_nil!,
+          device_state.device_ptr.not_nil!, od.device_ptr.not_nil!,
+          seq, @num_v_heads, @num_k_heads, @head_k, @head_v, @num_v_heads // @num_k_heads,
+          (1.0 / Math.sqrt(@head_k.to_f64)).to_f32, @k_head_tiled)
+        raise "gated_delta_rule_nowrite does not cover this block's shape" unless ok
+        @verify_rows = seq
+      else
+        CUDA.gated_delta_rule(
+          qc.device_ptr.not_nil!, kc.device_ptr.not_nil!, vc.device_ptr.not_nil!,
+          ad.device_ptr.not_nil!, bd.device_ptr.not_nil!,
+          device_state.device_ptr.not_nil!, od.device_ptr.not_nil!,
+          seq, @num_v_heads, @num_k_heads, @head_k, @head_v, @num_v_heads // @num_k_heads,
+          (1.0 / Math.sqrt(@head_k.to_f64)).to_f32, @k_head_tiled)
+      end
 
       # Per-head RMS norm with the shared [head_v] weight, in place.
       CUDA.head_rmsnorm_rows(od.device_ptr.not_nil!, ssm_gamma_dev, seq, @num_v_heads,

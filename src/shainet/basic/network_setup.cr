@@ -48,6 +48,89 @@ module SHAInet
     @lm_head_x : CudaMatrix?
     @lm_head_r : CudaMatrix?
 
+    # ── Speculative decoding (MTP) ──
+
+    # The MTP draft head, when one is attached (HFLoader.load_gguf_mtp).
+    property mtp : MTPHead?
+    # Run the head over every token the trunk processes, so its KV cache stays in lockstep. Off
+    # inside verify, whose rows are only committed once the accepted count is known.
+    property? mtp_auto : Bool = true
+    # LM head over every row of the pass rather than only the last.
+    property? all_logits : Bool = false
+    # Final hidden rows (after output_norm) of the last pass, kept while an MTP head is attached.
+    getter last_hidden : SimpleMatrix?
+
+    def embedding_layer : EmbeddingLayer?
+      @hidden_layers.each { |l| return l if l.is_a?(EmbeddingLayer) }
+      nil
+    end
+
+    # Run the trunk over `tokens` -- the last committed token followed by drafts -- without committing
+    # anything to the recurrent state: returns every row's logits, and leaves the rows pending until
+    # commit_verify!. Attention blocks append all rows to their KV caches as usual (commit_verify!
+    # truncates the rejected ones).
+    def verify(tokens : Array(Int32)) : SimpleMatrix
+      raise ArgumentError.new("verify takes 1-#{GGUFMatrix::MULTIROW_MAX_ROWS} tokens") unless 0 < tokens.size <= GGUFMatrix::MULTIROW_MAX_ROWS
+      prev_all, prev_auto = @all_logits, @mtp_auto
+      @all_logits = true
+      @mtp_auto = false
+      GatedDeltaNetBlock.verify = true
+      begin
+        run(tokens, stealth: true, return_matrix: true).as(SimpleMatrix)
+      ensure
+        GatedDeltaNetBlock.verify = false
+        @all_logits = prev_all
+        @mtp_auto = prev_auto
+      end
+    end
+
+    # Keep the first `keep` rows of the last verify pass, which started at cache position `base`:
+    # attention caches are cut back to base + keep, the recurrent blocks fold in those rows, and the
+    # MTP head catches up over them.
+    def commit_verify!(base : Int32, tokens : Array(Int32), keep : Int32) : Nil
+      raise ArgumentError.new("commit_verify! keep=#{keep} of #{tokens.size}") unless 0 < keep <= tokens.size
+      llama_cache_blocks.each(&.truncate_cache!(base + keep))
+      gdn_cache_blocks.each(&.commit_verify!(keep))
+      if (head = @mtp) && (hid = @last_hidden) && (emb = embedding_layer)
+        rows = SimpleMatrix.new(keep, hid.cols)
+        rows.data.to_unsafe.copy_from(hid.data.to_unsafe, keep.to_i64 * hid.cols)
+        head.catch_up(tokens[0, keep], rows, emb)
+      end
+    end
+
+    # Positions the attention caches hold (0 for a network without one).
+    def cached_positions : Int32
+      llama_cache_blocks.first?.try(&.cached_length) || 0
+    end
+
+    # Draft up to `k` tokens after `token` (sampled, not yet run by the trunk) with the MTP head,
+    # greedily. The head's cache and pending state are left as they were.
+    def mtp_draft(token : Int32, k : Int32) : Array(Int32)
+      head = @mtp || raise "no MTP head attached"
+      emb = embedding_layer || raise "no embedding layer"
+      lq = @lm_head_q || raise "MTP drafting needs the quantized LM head"
+      pre = head.pending_h
+      base = head.cached_length
+      drafts = [] of Int32
+      h = pre
+      tok = token
+      begin
+        k.times do
+          hout = head.forward([tok], h, emb)
+          logits = gpu_lm_head_q(hout, lq, nil, all_rows: true)
+          best = 0
+          row = logits.data
+          row.size.times { |j| best = j if row[j] > row[best] }
+          drafts << best
+          tok = best
+          h = hout
+        end
+      ensure
+        head.truncate!(base, pre)
+      end
+      drafts
+    end
+
     # Parameters for Rprop
     property etah_plus : Float64, etah_minus : Float64, delta_max : Float64, delta_min : Float64
     getter prev_mse : Float64
@@ -204,6 +287,7 @@ module SHAInet
       @hidden_layers.each do |l|
         l.as(GatedDeltaNetBlock).clear_cache! if l.is_a?(GatedDeltaNetBlock)
       end
+      @mtp.try(&.clear_cache!)
     end
 
     # Position the cache was saved at by save_cache!, or nil when there is no saved point.
@@ -224,8 +308,11 @@ module SHAInet
       end
       CUDA.device_synchronize if CUDA.fully_available?
       gdn_cache_blocks.each(&.save_state!)
+      @saved_mtp_h = @mtp.try(&.pending_h.clone)
       @saved_cache_positions = positions
     end
+
+    @saved_mtp_h : SimpleMatrix? = nil
 
     # Rewind the cache to the saved point and return its position, or return nil (changing nothing)
     # when there is no saved point or an attention block no longer reaches it -- the caller then
@@ -235,8 +322,14 @@ module SHAInet
       return unless pos
       blocks = llama_cache_blocks
       return if blocks.any? { |b| b.cached_length < pos }
+      if head = @mtp
+        return if head.cached_length < pos
+      end
       blocks.each(&.truncate_cache!(pos))
       gdn_cache_blocks.each(&.restore_saved_state!)
+      if (head = @mtp) && (h = @saved_mtp_h)
+        head.truncate!(pos, h.clone)
+      end
       pos
     end
 
@@ -252,18 +345,20 @@ module SHAInet
     class CacheSnapshot
       getter kv : Array(LlamaBlock::KVSnapshot)
       getter gdn : Array(GatedDeltaNetBlock::StateSnapshot)
+      getter mtp : MTPHead::Snapshot?
 
-      def initialize(@kv, @gdn)
+      def initialize(@kv, @gdn, @mtp = nil)
       end
 
       def bytes : Int64
-        kv.sum(&.bytes) + gdn.sum(&.bytes)
+        kv.sum(&.bytes) + gdn.sum(&.bytes) + (mtp.try(&.bytes) || 0_i64)
       end
     end
 
     def snapshot_cache : CacheSnapshot
       CUDA.device_synchronize if CUDA.fully_available?
-      CacheSnapshot.new(llama_cache_blocks.map(&.snapshot_kv), gdn_cache_blocks.map(&.snapshot_state))
+      CacheSnapshot.new(llama_cache_blocks.map(&.snapshot_kv), gdn_cache_blocks.map(&.snapshot_state),
+        @mtp.try(&.snapshot))
     end
 
     # Put a snapshot back. All or nothing: returns false, changing nothing, when any block can no
@@ -273,8 +368,13 @@ module SHAInet
       gdns = gdn_cache_blocks
       return false unless blocks.size == snap.kv.size && gdns.size == snap.gdn.size
       return false unless blocks.each_with_index.all? { |b, i| b.can_restore_kv?(snap.kv[i]) }
+      head = @mtp
+      hs = snap.mtp
+      return false unless head.nil? == hs.nil?
+      return false if head && hs && !head.can_restore?(hs)
       blocks.each_with_index { |b, i| b.restore_kv!(snap.kv[i]) }
       gdns.each_with_index { |g, i| g.restore_state!(snap.gdn[i]) }
+      head.restore!(hs) if head && hs
       CUDA.device_synchronize if CUDA.fully_available?
       true
     end

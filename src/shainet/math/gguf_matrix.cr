@@ -105,6 +105,16 @@ module SHAInet
       # Ensure activation is resident on device (cheap no-op when already synced).
       x.sync_to_device!("gguf_gemv_in") unless x.device_dirty?
 
+      # 2-8 rows (a speculative verify pass, a short tool result): one read of the weight for all
+      # rows, from int8 activations. The batched path below costs a weight decode plus a tensor-core
+      # tile sized for hundreds of rows, which at these sizes is several decode steps' worth.
+      if x.rows > 1 && multirow?(x.rows) &&
+         CUDA.gemv_mr(@ggml_type.value.to_i32, x.device_ptr.not_nil!, @dev_ptr,
+           result.device_ptr.not_nil!, x.rows, @cols, @rows)
+        result.mark_device_dirty!
+        return result
+      end
+
       # M == 1 (decode) is already optimal as a GEMV: the weight is streamed exactly once. For
       # M > 1 the GEMV kernel gives each (output, token) pair its own block, so it re-dequantizes
       # the whole weight per token and reuses nothing -- measured flat at 0.54 ms/token from M=1 to
@@ -163,6 +173,19 @@ module SHAInet
     def gemv(x : CudaMatrix) : CudaMatrix
       result = CudaMatrix.new(x.rows, @cols)
       gemv_into(x, result)
+    end
+
+    # Largest row count the multi-row GEMV takes (GEMV_MR_MAX_ROWS in gemv_multirow.cuh). Above it
+    # the batched GEMM paths win. SHAINET_GEMV_MR=0 turns the multi-row path off.
+    MULTIROW_MAX_ROWS = 8
+    @@multirow : Bool = ENV.fetch("SHAINET_GEMV_MR", "1") != "0"
+
+    def self.multirow=(value : Bool)
+      @@multirow = value
+    end
+
+    private def multirow?(rows : Int32) : Bool
+      @@multirow && rows <= MULTIROW_MAX_ROWS
     end
 
     # Scratch for the dequantized weight tile, shared across every GGUFMatrix.
@@ -408,7 +431,11 @@ module SHAInet
       @@shared_src = x.device_ptr || Pointer(Float32).null
       @@shared_ready = false
       begin
-        yield
+        if x.rows > 1 && x.rows <= MULTIROW_MAX_ROWS && @@multirow
+          CUDA.gemv_mr_share { yield }
+        else
+          yield
+        end
       ensure
         @@shared_src = prev
         @@shared_ready = false
@@ -485,6 +512,8 @@ module SHAInet
     # cannot take the int8 path; the caller then runs swiglu_forward and gemm_into as before.
     def gemm_into_swiglu(gate : CudaMatrix, up : CudaMatrix, result : CudaMatrix) : Bool
       return false unless gate.rows > 1 && MMQ_TYPES.includes?(@ggml_type) && GGUFMatrix.mmq?
+      # A few rows go through swiglu_forward and gemv_into, which takes the multi-row GEMV.
+      return false if multirow?(gate.rows)
       return false if MMQ_S16_TYPES.includes?(@ggml_type) && !MMQ_S16_ON
       k = @rows
       m = gate.rows

@@ -3262,7 +3262,8 @@ __global__ void gated_delta_rule_cols_kernel(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     const float* __restrict__ alpha, const float* __restrict__ beta,
     float* __restrict__ state, float* __restrict__ out,
-    int seq, int nv, int nk, int dk, int dv, int heads_per_k, float q_scale, int k_head_tiled)
+    int seq, int nv, int nk, int dk, int dv, int heads_per_k, float q_scale, int k_head_tiled,
+    int write_state)
 {
     // Padded by one per group so the four groups' lanes read four different banks.
     __shared__ float qs[2][GDR_GROUPS * (GDR_MAX_ROWS + 1)];
@@ -3342,6 +3343,7 @@ __global__ void gated_delta_rule_cols_kernel(
         if (g == 0) out[(size_t)t * vstride + (size_t)h * dv + c] = o;
     }
 
+    if (!write_state) return;
     #pragma unroll
     for (int r = 0; r < GDR_MAX_ROWS; ++r)
         if (r < rpg) state[sbase + (size_t)(g * rpg + r) * dv + c] = S[r];
@@ -3612,13 +3614,29 @@ static int gated_delta_rule_cols(const float* q, const float* k, const float* v,
     if (!enabled || dv % GDR_COLS != 0 || dk % GDR_GROUPS != 0 || dk / GDR_GROUPS > GDR_MAX_ROWS) return 0;
     dim3 grid(nv, dv / GDR_COLS);
     gated_delta_rule_cols_kernel<<<grid, 128>>>(q, k, v, alpha, beta, state, out, seq, nv, nk, dk,
-                                                dv, heads_per_k, q_scale, k_head_tiled);
+                                                dv, heads_per_k, q_scale, k_head_tiled, 1);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA Error in gated_delta_rule_cols: %s\n", cudaGetErrorString(err));
         return 0;
     }
     return 1;
+}
+
+// Speculative verify: the recurrence's outputs for `seq` rows, leaving `state` at the pre-verify
+// point. Once the kept row count is known, gated_delta_rule over those rows' stashed inputs moves
+// the state forward -- no copy of the state is needed to undo the rejected rows. 1 on success, 0
+// for shapes the column kernel does not cover.
+int gated_delta_rule_nowrite(const float* q, const float* k, const float* v,
+                             const float* alpha, const float* beta, float* state, float* out,
+                             int seq, int nv, int nk, int dk, int dv, int heads_per_k,
+                             float q_scale, int k_head_tiled) {
+    if (seq <= 0 || nv <= 0) return 1;
+    if (dv % GDR_COLS != 0 || dk % GDR_GROUPS != 0 || dk / GDR_GROUPS > GDR_MAX_ROWS) return 0;
+    dim3 grid(nv, dv / GDR_COLS);
+    gated_delta_rule_cols_kernel<<<grid, 128>>>(q, k, v, alpha, beta, state, out, seq, nv, nk, dk,
+                                                dv, heads_per_k, q_scale, k_head_tiled, 0);
+    return cudaGetLastError() == cudaSuccess ? 1 : 0;
 }
 
 void gated_delta_rule(const float* q, const float* k, const float* v,
@@ -4316,6 +4334,8 @@ __global__ void gemv_q6k_kernel(const float* __restrict__ x,
     if (lane == 0) y[(long)m * N + n] = acc;
 }
 
+#include "gemv_multirow.cuh"
+
 // ---- Gated DeltaNet: gates and short causal convolution on the device ----
 //
 // These two are the last elementwise stages the mixer ran on the host. With them the whole mixer
@@ -4691,6 +4711,34 @@ void short_conv_silu3(float* d0, const float* s0, float* st0, const float* w0,
     if (err != cudaSuccess) {
         printf("CUDA Error in short_conv_silu3: %s\n", cudaGetErrorString(err));
     }
+}
+
+// Speculative verify: the convolution of short_conv_silu3 WITHOUT the state roll. The verify pass
+// does not know yet how many of its rows will be kept, so it leaves the conv state at the
+// pre-verify point and short_conv_state3 rolls it over the kept rows afterwards.
+void short_conv_silu3_nostate(float* d0, const float* s0, const float* st0, const float* w0,
+                              float* d1, const float* s1, const float* st1, const float* w1,
+                              float* d2, const float* s2, const float* st2, const float* w2,
+                              int seq, int ch0, int ch1, int ch2, int kernel, int apply_silu) {
+    if (seq <= 0 || kernel <= 0) return;
+    int total = ch0 + ch1 + ch2;
+    if (total <= 0) return;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    short_conv_silu3_kernel<<<dim3(blocks, seq), threads>>>(d0, s0, st0, w0, d1, s1, st1, w1,
+                                                            d2, s2, st2, w2, seq, ch0, ch1, ch2,
+                                                            kernel, apply_silu);
+}
+
+// The state roll alone, over `seq` rows of the three pre-conv inputs.
+void short_conv_state3(float* st0, const float* s0, float* st1, const float* s1,
+                       float* st2, const float* s2, int seq, int ch0, int ch1, int ch2, int kernel) {
+    if (seq <= 0 || kernel <= 1) return;
+    int total = ch0 + ch1 + ch2;
+    if (total <= 0) return;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    short_conv_state3_kernel<<<blocks, threads>>>(st0, s0, st1, s1, st2, s2, seq, ch0, ch1, ch2, kernel);
 }
 
 void short_conv(float* dst, const float* src, float* state, const float* w,

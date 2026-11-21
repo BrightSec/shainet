@@ -447,6 +447,39 @@ module SHAInet
       @@mmq_quantize_proc.not_nil!.call(x, xq, xs, xsum, m, k)
     end
 
+    @@gemv_mr_proc : Proc(Int32, Pointer(Float32), Pointer(UInt8), Pointer(Float32), Int32, Int32, Int32, Int32)?
+    @@gemv_mr_share_begin : Proc(Nil)?
+    @@gemv_mr_share_end : Proc(Nil)?
+    @@gemv_mr_checked = false
+
+    # Multi-row GEMV for 1-8 rows (the speculative verify pass): reads each weight block once for all
+    # rows, from int8-quantized activations. False when the kernel is missing or the type or row
+    # count is not covered, so the caller keeps its batched path.
+    def gemv_mr(ggml_type : Int32, x : Pointer(Float32), w : Pointer(UInt8), y : Pointer(Float32),
+                m : Int32, n : Int32, k : Int32) : Bool
+      unless @@gemv_mr_checked
+        @@gemv_mr_checked = true
+        @@gemv_mr_proc = load_kernel_proc("gemv_mr",
+          Proc(Int32, Pointer(Float32), Pointer(UInt8), Pointer(Float32), Int32, Int32, Int32, Int32))
+        @@gemv_mr_share_begin = load_kernel_proc("gemv_mr_share_begin", Proc(Nil))
+        @@gemv_mr_share_end = load_kernel_proc("gemv_mr_share_end", Proc(Nil))
+      end
+      fn = @@gemv_mr_proc
+      return false unless fn
+      fn.call(ggml_type, x, w, y, m, n, k) != 0
+    end
+
+    # Bracket a group of gemv_mr calls that read the same input, so it is quantized once.
+    def gemv_mr_share(&)
+      gemv_mr(0, Pointer(Float32).null, Pointer(UInt8).null, Pointer(Float32).null, 0, 0, 0) unless @@gemv_mr_checked
+      @@gemv_mr_share_begin.try &.call
+      begin
+        yield
+      ensure
+        @@gemv_mr_share_end.try &.call
+      end
+    end
+
     # Decode `rows` weight rows from `row0` to int8 + per-32 scales (+ offsets). False for a type the
     # int8 path does not cover.
     def mmq_decode_rows(ggml_type : Int32, w : Pointer(UInt8), wq : Pointer(Int8), ws : Pointer(Float32),
@@ -1236,6 +1269,72 @@ module SHAInet
       end
       raise "CUDA kernels not available" unless fn
       fn.call(dst, src, rows, kv_heads, head_dim)
+    end
+
+    # ── Speculative verify: Gated DeltaNet without state writes, and the deferred commit ──
+
+    @@gdr_nowrite_proc : Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+                              Pointer(Float32), Pointer(Float32), Pointer(Float32),
+                              Int32, Int32, Int32, Int32, Int32, Int32, Float32, Int32, Int32)?
+    @@conv3_nostate_proc : Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+                                Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+                                Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+                                Int32, Int32, Int32, Int32, Int32, Int32, Nil)?
+    @@conv_state3_proc : Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+                              Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Nil)?
+    @@verify_kernels_checked = false
+
+    # Whether the loaded library has the three kernels a speculative verify pass needs.
+    def gdn_verify_kernels_available? : Bool
+      unless @@verify_kernels_checked
+        @@verify_kernels_checked = true
+        @@gdr_nowrite_proc = load_kernel_proc("gated_delta_rule_nowrite",
+          Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+               Pointer(Float32), Pointer(Float32), Pointer(Float32),
+               Int32, Int32, Int32, Int32, Int32, Int32, Float32, Int32, Int32))
+        @@conv3_nostate_proc = load_kernel_proc("short_conv_silu3_nostate",
+          Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+               Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+               Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+               Int32, Int32, Int32, Int32, Int32, Int32, Nil))
+        @@conv_state3_proc = load_kernel_proc("short_conv_state3",
+          Proc(Pointer(Float32), Pointer(Float32), Pointer(Float32), Pointer(Float32),
+               Pointer(Float32), Pointer(Float32), Int32, Int32, Int32, Int32, Int32, Nil))
+      end
+      !(@@gdr_nowrite_proc.nil? || @@conv3_nostate_proc.nil? || @@conv_state3_proc.nil?)
+    end
+
+    # gated_delta_rule's outputs, leaving the recurrent state untouched. False for a shape the
+    # column kernel does not cover.
+    def gated_delta_rule_nowrite(q : Pointer(Float32), k : Pointer(Float32), v : Pointer(Float32),
+                                 alpha : Pointer(Float32), beta : Pointer(Float32),
+                                 state : Pointer(Float32), out_ptr : Pointer(Float32),
+                                 seq : Int32, nv : Int32, nk : Int32, dk : Int32, dv : Int32,
+                                 heads_per_k : Int32, q_scale : Float32, k_head_tiled : Bool) : Bool
+      return false unless gdn_verify_kernels_available?
+      @@gdr_nowrite_proc.not_nil!.call(q, k, v, alpha, beta, state, out_ptr, seq, nv, nk, dk, dv,
+        heads_per_k, q_scale, k_head_tiled ? 1 : 0) != 0
+    end
+
+    # short_conv_silu3 without rolling the conv state.
+    def short_conv_silu3_nostate(d0 : Pointer(Float32), s0 : Pointer(Float32), st0 : Pointer(Float32), w0 : Pointer(Float32),
+                                 d1 : Pointer(Float32), s1 : Pointer(Float32), st1 : Pointer(Float32), w1 : Pointer(Float32),
+                                 d2 : Pointer(Float32), s2 : Pointer(Float32), st2 : Pointer(Float32), w2 : Pointer(Float32),
+                                 seq : Int32, ch0 : Int32, ch1 : Int32, ch2 : Int32,
+                                 kernel : Int32, apply_silu : Bool) : Bool
+      return false unless gdn_verify_kernels_available?
+      @@conv3_nostate_proc.not_nil!.call(d0, s0, st0, w0, d1, s1, st1, w1, d2, s2, st2, w2,
+        seq, ch0, ch1, ch2, kernel, apply_silu ? 1 : 0)
+      true
+    end
+
+    # Roll three conv states over `seq` rows of their pre-conv inputs.
+    def short_conv_state3(st0 : Pointer(Float32), s0 : Pointer(Float32), st1 : Pointer(Float32), s1 : Pointer(Float32),
+                          st2 : Pointer(Float32), s2 : Pointer(Float32), seq : Int32,
+                          ch0 : Int32, ch1 : Int32, ch2 : Int32, kernel : Int32) : Bool
+      return false unless gdn_verify_kernels_available?
+      @@conv_state3_proc.not_nil!.call(st0, s0, st1, s1, st2, s2, seq, ch0, ch1, ch2, kernel)
+      true
     end
 
     # dlopen/dlsym once per symbol. The four multi-row prefill kernels share this rather
