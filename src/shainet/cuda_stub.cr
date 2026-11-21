@@ -212,6 +212,30 @@ module SHAInet
       false
     end
 
+    def gemv_mr(*args) : Bool
+      false
+    end
+
+    def gdn_verify_kernels_available? : Bool
+      false
+    end
+
+    def gated_delta_rule_nowrite(*args) : Bool
+      false
+    end
+
+    def short_conv_silu3_nostate(*args) : Bool
+      false
+    end
+
+    def short_conv_state3(*args) : Bool
+      false
+    end
+
+    def gemv_mr_share(&)
+      yield
+    end
+
     def mmq_decode_rows(*args) : Bool
       false
     end

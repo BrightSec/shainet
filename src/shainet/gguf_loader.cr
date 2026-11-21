@@ -2,6 +2,84 @@ require "./gguf"
 
 module SHAInet
   module HFLoader
+    # Set by load_gguf when the VRAM budget had no room for an MTP head beside a fully resident trunk;
+    # load_gguf_mtp then returns nil.
+    @@mtp_declined = false
+
+    def self.mtp_declined? : Bool
+      @@mtp_declined
+    end
+
+    # VRAM an MTP head from `path` will take: its block's weights plus one attention layer of KV at
+    # `max_context`. 0 when the file has no MTP block, or speculation is off (SHAINET_SPEC_K=0).
+    private def self.mtp_reserve_bytes(path : String, max_context : Int32, kv_per_token : Int64) : Int64
+      return 0_i64 if ENV["SHAINET_SPEC_K"]? == "0" || !File.file?(path)
+      gf = GGUF::File.open(path)
+      arch = gf.meta_string("general.architecture") || return 0_i64
+      n = (gf.meta_u32("#{arch}.block_count") || return 0_i64).to_i32
+      nextn = (gf.meta_u32("#{arch}.nextn_predict_layers") || 0).to_i32
+      return 0_i64 if nextn < 1
+      prefix = "blk.#{n - nextn}."
+      weights = 0_i64
+      gf.tensors.each { |name, info| weights += info.byte_size.to_i64 if name.starts_with?(prefix) }
+      return 0_i64 if weights == 0
+      bytes = weights + kv_per_token * max_context
+      Log.info { "gguf: reserving #{bytes // (1024 * 1024)} MB for the MTP head in #{File.basename(path)}" }
+      bytes
+    rescue
+      0_i64
+    end
+
+    # Load the MTP (NextN) draft head of a qwen35 GGUF: the `blk.N.*` block after the trunk's layers
+    # (N = block_count - nextn_predict_layers), either from the model file itself or from a sidecar
+    # that carries only that block (unsloth's `MTP/mtp-*.gguf`). Only the block, eh_proj and its
+    # three norms are read; the head uses the trunk's embedding and LM head, as llama.cpp does when
+    # the file has no nextn.embed_tokens / shared_head_head.
+    #
+    # Returns nil when the file has no MTP block. The head's weights go to the device individually
+    # (about 270 MB for the 27B), so call this after the trunk is placed.
+    def self.load_gguf_mtp(path : String, max_context : Int32? = nil) : MTPHead?
+      return if @@mtp_declined
+      gf = GGUF::File.open(path)
+      arch = gf.meta_string("general.architecture") || raise "GGUF missing general.architecture"
+      raise "unsupported GGUF architecture for MTP: #{arch} (expected qwen35)" unless arch == "qwen35"
+      n_layers = (gf.meta_u32("#{arch}.block_count") || raise "missing block_count").to_i32
+      nextn = (gf.meta_u32("#{arch}.nextn_predict_layers") || 0).to_i32
+      return if nextn < 1
+      idx = n_layers - nextn
+      return unless gf.tensors.has_key?("blk.#{idx}.nextn.eh_proj.weight")
+
+      d = (gf.meta_u32("#{arch}.embedding_length") || raise "missing embedding_length").to_i32
+      ff = (gf.meta_u32("#{arch}.feed_forward_length") || raise "missing feed_forward_length").to_i32
+      n_heads = (gf.meta_u32("#{arch}.attention.head_count") || raise "missing head_count").to_i32
+      n_kv_heads = (gf.meta_u32("#{arch}.attention.head_count_kv") || 4).to_i32
+      head_dim = (gf.meta_u32("#{arch}.attention.key_length") || (d // n_heads)).to_i32
+      eps = (gf.meta_f32("#{arch}.attention.layer_norm_rms_epsilon") || 1e-6_f32).to_f64
+      rope_theta = (gf.meta_f32("#{arch}.rope.freq_base") || 10_000_000.0_f32).to_f64
+      partial_rotary = (gf.meta_u32("#{arch}.rope.dimension_count") || 64).to_i32
+
+      holder = Network.new
+      holder.add_layer(:input, 1)
+      load_gguf_full_attn_layer(gf, holder, idx, d, ff, eps, n_heads, n_kv_heads, head_dim,
+        rope_theta, partial_rotary, true)
+      block = holder.hidden_layers.last.as(LlamaBlock)
+      block.kv_max_context = max_context if max_context
+
+      eh = load_gguf_weight(gf, gf.tensors["blk.#{idx}.nextn.eh_proj.weight"], true)
+      eh_q = eh.as?(QuantizedWeight) || raise "MTP eh_proj did not load as a quantized device weight"
+      norm = ->(name : String) do
+        n = RMSNorm.new(d, eps)
+        n.gamma = read_gguf_f32_matrix(gf, gf.tensors[name], 1, d)
+        n
+      end
+      head_name = "blk.#{idx}.nextn.shared_head_norm.weight"
+      head_norm = gf.tensors.has_key?(head_name) ? norm.call(head_name) : norm.call("output_norm.weight")
+      Log.info { "gguf: MTP head blk.#{idx} loaded from #{path}" }
+      MTPHead.new(block, eh_q, norm.call("blk.#{idx}.nextn.enorm.weight"),
+        norm.call("blk.#{idx}.nextn.hnorm.weight"), head_norm, d)
+      # gf stays open: the mmap backs nothing on the device, but closing it is not needed either.
+    end
+
     # Load a model from a GGUF file (llama.cpp / Ollama format).
     #
     # The GGUF contains everything: architecture metadata, tokenizer, and
@@ -151,6 +229,11 @@ module SHAInet
         # calculation: a 60000-token prefill with 64/64 resident finished with 506 MB still free, and
         # that was with a 5300 MB reserve, i.e. less than this.
         derived = (derived * 110) // 100
+        # An MTP draft head is loaded after the trunk (load_gguf_mtp), so its weights and its own KV
+        # cache have to be in the reserve, or the trunk takes that room and the head's cache runs out
+        # mid-conversation.
+        mtp_bytes = mtp_reserve_bytes(ENV["SHAINET_MTP"]? || path, max_context, 2_i64 * n_kv_heads * kv_row_bytes)
+        derived += mtp_bytes
         derived_mb = (derived // (1024 * 1024)).to_i
 
         # An explicit reserve always wins: it is the escape hatch for trading context for speed.
@@ -167,14 +250,35 @@ module SHAInet
         end
         if CUDA.fully_available?
           if info = CUDA.memory_info
-            budget = (info[:free].to_i64) - (reserve_mb.to_i64 * 1024 * 1024)
-            # lm_head is always placed on the device, so it comes out of the budget first.
-            budget -= lm_head_bytes.to_i64
-            fits = 0
-            (num_transformer_layers - 1).downto(0) do |i|
-              break if budget < layer_bytes[i].to_i64
-              budget -= layer_bytes[i].to_i64
-              fits += 1
+            place = ->(reserve_bytes : Int64) do
+              budget = (info[:free].to_i64) - reserve_bytes
+              # lm_head is always placed on the device, so it comes out of the budget first.
+              budget -= lm_head_bytes.to_i64
+              fits = 0
+              (num_transformer_layers - 1).downto(0) do |i|
+                break if budget < layer_bytes[i].to_i64
+                budget -= layer_bytes[i].to_i64
+                fits += 1
+              end
+              fits
+            end
+            fits = place.call(reserve_mb.to_i64 * 1024 * 1024)
+            # The MTP head only pays while the whole trunk is on the card: a host layer costs about a
+            # second per token here, far more than speculation saves. If its reserve would push trunk
+            # layers to the host, leave the head out and keep the trunk resident.
+            if mtp_bytes > 0 && fits < num_transformer_layers && ENV["SHAINET_GGUF_RESERVE_MB"]?.nil?
+              without = place.call(reserve_mb.to_i64 * 1024 * 1024 - mtp_bytes)
+              if without > fits
+                Log.warn do
+                  "gguf: not enough VRAM for the MTP head (#{mtp_bytes // (1024 * 1024)} MB) without moving " \
+                  "#{without - fits} trunk layer(s) to the CPU; decoding without speculation. Lower " \
+                  "SHAINET_MAX_CONTEXT or free VRAM to enable it."
+                end
+                @@mtp_declined = true
+                reserve_mb -= (mtp_bytes // (1024 * 1024)).to_i
+                mtp_bytes = 0_i64
+                fits = without
+              end
             end
             gpu_layers = fits
           else
@@ -306,7 +410,7 @@ module SHAInet
           layer.kv_max_context = max_context if layer.responds_to?(:kv_max_context=)
         end
 
-        tune_prefill_chunk(kv_per_token, max_context)
+        tune_prefill_chunk(kv_per_token, max_context, mtp_bytes)
         warn_unconsumed_tensors(gf, num_transformer_layers)
         Log.info { "gguf: loaded #{num_transformer_layers} layers from #{path}" }
         net
@@ -376,7 +480,7 @@ module SHAInet
     # covers both without the caller choosing.
     #
     # SHAINET_GDN_CHUNK / SHAINET_PREFILL_CHUNK still win: an explicit setting is never overridden.
-    private def self.tune_prefill_chunk(kv_per_token : Int64, max_context : Int32)
+    private def self.tune_prefill_chunk(kv_per_token : Int64, max_context : Int32, extra_bytes : Int64 = 0_i64)
       return unless CUDA.fully_available?
       if ENV["SHAINET_GDN_CHUNK"]? || ENV["SHAINET_PREFILL_CHUNK"]?
         # An explicit chunk still needs the network-level slice raised to match, or the slice (512 by
@@ -395,7 +499,8 @@ module SHAInet
       # tokens. Sizing the chunk from the first number would pick the largest tier and then OOM in
       # the middle of a long prefill -- turning a speed knob into a crash.
       kv_mb = (kv_per_token * max_context) // (1024 * 1024)
-      headroom_mb = free_mb - kv_mb
+      # ...and whatever is loaded after the trunk (an MTP head: its weights and KV).
+      headroom_mb = free_mb - kv_mb - extra_bytes // (1024 * 1024)
       # Measured, not estimated, on the 27B GSQ IQ3_S at 64K context with the fp8 KV cache pinned at
       # full size: with 1630 MB of projected headroom, chunk 1024 left 778 MB free after a 3.5K-token
       # prefill and 717 MB after a 55K-token one, so the tier costs ~910 MB of the projection at its

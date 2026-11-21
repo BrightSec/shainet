@@ -472,6 +472,16 @@ module SHAInet
         if fn = @final_norm
           matrix = Profile.measure("net.final_norm") { fn.forward(matrix.as(SimpleMatrix)) }
         end
+        # The MTP head reads the trunk's final hidden rows (after output_norm, as llama.cpp's
+        # h_nextn), paired with the tokens one position later.
+        if head = @mtp
+          hid = matrix.as(SimpleMatrix)
+          @last_hidden = hid
+          if @mtp_auto && (emb = embedding_layer)
+            tokens = (0...input.rows).map { |r| input[r, 0].to_i }
+            Profile.measure("net.mtp_catch_up") { head.catch_up(tokens, hid, emb) }
+          end
+        end
         # When the quantized head applies the bias on the device, the host loop below
         # is skipped: it walked the whole vocab row per token.
         bias_on_device = false
@@ -479,7 +489,7 @@ module SHAInet
           if lq = @lm_head_q
             row_bias = matrix.as(SimpleMatrix).rows >= 1 ? b : nil
             bias_on_device = !row_bias.nil?
-            gpu_lm_head_q(matrix.as(SimpleMatrix), lq, row_bias)
+            gpu_lm_head_q(matrix.as(SimpleMatrix), lq, row_bias, all_rows: @all_logits)
           elsif w.is_a?(CudaMatrix)
             gpu_lm_head(matrix.as(SimpleMatrix), w.as(CudaMatrix))
           else
@@ -1741,9 +1751,10 @@ module SHAInet
     # can skip its host loop. That loop walked the full vocab row (151936 wide on
     # Qwen3) once per token, which the profiler showed at 0.25 ms/step.
     private def gpu_lm_head_q(matrix : SimpleMatrix, weights : QuantizedWeight,
-                              bias : SimpleMatrix? = nil) : SimpleMatrix
-      # Extract last token for transformer architectures (language modeling).
-      last = if matrix.rows > 1
+                              bias : SimpleMatrix? = nil, all_rows : Bool = false) : SimpleMatrix
+      # Extract last token for transformer architectures (language modeling), unless every row's
+      # logits are wanted (a speculative verify pass).
+      last = if matrix.rows > 1 && !all_rows
                sm = SimpleMatrix.new(1, matrix.cols)
                matrix.cols.times { |j| sm[0, j] = matrix[matrix.rows - 1, j] }
                sm
@@ -1751,12 +1762,20 @@ module SHAInet
                matrix
              end
 
-      x_gpu = (@lm_head_x ||= CudaMatrix.new(last.rows, last.cols))
+      x_gpu = @lm_head_x
+      unless x_gpu && x_gpu.rows == last.rows && x_gpu.cols == last.cols
+        x_gpu.try(&.free!)
+        @lm_head_x = x_gpu = CudaMatrix.new(last.rows, last.cols)
+      end
       x_gpu.raw_data.to_unsafe.copy_from(last.data.to_unsafe, last.rows * last.cols)
       x_gpu.mark_host_modified!
       x_gpu.sync_to_device!("lm_head_q_in")
 
-      r_gpu = (@lm_head_r ||= CudaMatrix.new(last.rows, weights.cols))
+      r_gpu = @lm_head_r
+      unless r_gpu && r_gpu.rows == last.rows && r_gpu.cols == weights.cols
+        r_gpu.try(&.free!)
+        @lm_head_r = r_gpu = CudaMatrix.new(last.rows, weights.cols)
+      end
       weights.gemv_into(x_gpu, r_gpu)
 
       if b = bias
@@ -1768,7 +1787,9 @@ module SHAInet
           bd.sync_to_device!("lm_head_bias")
           @lm_head_b = bd
         end
-        CUDA.add_inplace(r_gpu.device_ptr.not_nil!, bd.device_ptr.not_nil!, r_gpu.cols)
+        r_gpu.rows.times do |r|
+          CUDA.add_inplace(r_gpu.device_ptr.not_nil! + r.to_i64 * r_gpu.cols, bd.device_ptr.not_nil!, r_gpu.cols)
+        end
         r_gpu.mark_device_dirty!
       end
 

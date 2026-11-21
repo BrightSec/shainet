@@ -1161,6 +1161,36 @@ module AgentDemo
     @@cancelled
   end
 
+  # Draft tokens per speculative step when an MTP head is loaded. 3 is FreeToken's and llama.cpp's
+  # default for this head; SHAINET_SPEC_K=0 turns speculation off.
+  @@spec_k : Int32 = (ENV["SHAINET_SPEC_K"]?.try(&.to_i?) || 3).clamp(0, 7)
+
+  def self.spec_k : Int32
+    @@spec_k
+  end
+
+  # An MTP sidecar for `model` (a GGUF without its own MTP block): a `mtp-*.gguf` under ~/models
+  # whose architecture, width and depth match the model's, e.g. unsloth's
+  # MTP/mtp-Qwen3.8-27B-Q4_0.gguf saved to ~/models/<any>/. Nil when there is none.
+  def self.find_mtp_sidecar(model : String) : String?
+    meta = ->(path : String) do
+      gf = SHAInet::GGUF::File.open(path)
+      arch = gf.meta_string("general.architecture") || ""
+      {arch, gf.meta_u32("#{arch}.embedding_length"), gf.meta_u32("#{arch}.block_count"),
+       gf.meta_u32("#{arch}.nextn_predict_layers") || 0_u32}
+    end
+    arch, width, depth, nextn = meta.call(model)
+    return if nextn > 0 # the model carries its own head
+    Dir.glob(File.join(Path.home, "models", "*", "mtp-*.gguf")).sort.find do |cand|
+      a, w, dd, n = meta.call(cand)
+      a == arch && w == width && n > 0 && (d0 = depth) && dd == d0 + n
+    rescue
+      false
+    end
+  rescue
+    nil
+  end
+
   def self.cancel!
     @@cancelled = true
   end
@@ -2055,6 +2085,7 @@ module AgentDemo
     # stops for real only on a stop token, a user interrupt (Ctrl-C/steer), or the window filling.
     # Summaries pass a small `max_tokens` (SUMMARY_TOKENS) to stay bounded.
     private def generate_from(prompt : Array(Int32), max_tokens : Int32, echo : Bool = false) : Tuple(String, Array(Int32))
+      return generate_from_spec(prompt, max_tokens, echo) if @net.mtp && AgentDemo.spec_k > 0
       # Never generate past the KV budget: the cache is pinned at @max_context, and running into it
       # mid-reply raises out of the decode loop and loses the turn.
       max_tokens = Math.min(max_tokens, @max_context - prompt.size)
@@ -2119,9 +2150,116 @@ module AgentDemo
         @cache_ids << id
       end
       renderer.try(&.finish)
+      if ENV["SHAINET_SPEC_STATS"]? && generated.size > 0
+        secs = (Time.instant - gen_started).total_seconds
+        STDERR.puts "  #{"decode: #{generated.size} tok in #{secs.round(1)} s = #{(generated.size / secs).round(1)} tok/s".colorize(:dark_gray)}"
+      end
       # scrub: a broken model can emit tokens that decode to invalid UTF-8, which
       # would crash downstream regex/parsing. The raw ids go back too: the decoded text is
       # for humans and parsing, the ids are what the KV cache actually holds.
+      {@tokenizer.decode(generated).scrub, generated}
+    end
+
+    # generate_from with MTP speculative decoding: per step the draft head proposes `k` tokens after
+    # the one just sampled, the trunk runs all of them in one pass, and the drafts are kept while the
+    # trunk's own sample at each row agrees with them. A draft is accepted with exactly the trunk's
+    # probability for it, so the output follows the trunk's sampling distribution; the gain is that a
+    # step of ~1.4 single-token passes yields several tokens.
+    #
+    # Same contract as generate_from: stop tokens end the turn and are not fed to the cache,
+    # Ctrl-C and steering are checked every step, and @cache_ids tracks what the cache holds.
+    private def generate_from_spec(prompt : Array(Int32), max_tokens : Int32, echo : Bool) : Tuple(String, Array(Int32))
+      max_tokens = Math.min(max_tokens, @max_context - prompt.size)
+      logits = prefill(prompt)
+      generated = [] of Int32
+      renderer = echo ? AgentDemo::StreamRenderer.new(STDERR) : nil
+      prev = ""
+      gen_started = Time.instant
+      k = AgentDemo.spec_k
+      steps = 0
+      drafted = 0
+      accepted = 0
+      emit = ->(id : Int32) do
+        generated << id
+        full = AgentDemo.complete_utf8(@tokenizer.decode(generated))
+        if r = renderer
+          r.feed(full.byte_slice(prev.bytesize)) if full.bytesize > prev.bytesize
+        end
+        prev = full
+      end
+
+      row = logits.rows - 1
+      x = @sampler.sample(logits, row)
+      x = -1 unless logits[row, x].finite?
+      while generated.size < max_tokens
+        Fiber.yield
+        if AgentDemo.cancelled?
+          STDERR.puts "\n  #{"interrupted".colorize(:yellow)}"
+          break
+        end
+        AgentDemo.pump_input
+        if AgentDemo.steer_pending?
+          STDERR.puts "\n  #{"steering".colorize(:cyan)}"
+          break
+        end
+        if (bar = @status_bar) && generated.size > 0
+          secs = (Time.instant - gen_started).total_seconds
+          rate = secs > 0 ? generated.size / secs : 0.0
+          acc = drafted > 0 ? " · #{(100 * accepted // drafted)}% drafts kept" : ""
+          bar.text = " ctx #{@cache_ids.size}/#{@max_context} · #{generated.size} tok · " \
+                     "#{rate.round(1)} tok/s#{acc} · #{secs.round(0).to_i}s"
+        end
+        break if x < 0 || @stop_ids.includes?(x)
+        emit.call(x)
+
+        # Drafts never run past the turn's budget or the context window.
+        room = Math.min(max_tokens - generated.size, @max_context - 1 - @cache_ids.size)
+        kk = Math.min(k, room)
+        if kk <= 0
+          logits = @net.run([x], stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
+          @cache_ids << x
+          row = logits.rows - 1
+          nx = @sampler.sample(logits, row)
+          x = logits[row, nx].finite? ? nx : -1
+          next
+        end
+
+        base = @net.cached_positions
+        drafts = @net.mtp_draft(x, kk)
+        toks = [x] + drafts
+        rows = @net.verify(toks)
+        a = 0
+        stop = false
+        y = -1
+        loop do
+          s = @sampler.sample(rows, a)
+          s = -1 unless rows[a, s].finite?
+          if a < kk && s == drafts[a]
+            # An accepted draft that is a stop token ends the turn: it is neither fed nor shown.
+            if @stop_ids.includes?(s)
+              stop = true
+              break
+            end
+            a += 1
+            next
+          end
+          y = s
+          break
+        end
+        @net.commit_verify!(base, toks, a + 1)
+        @cache_ids.concat(toks[0, a + 1])
+        drafts[0, a].each { |d| emit.call(d) }
+        steps += 1
+        drafted += kk
+        accepted += a
+        break if stop
+        x = y
+      end
+      renderer.try(&.finish)
+      if steps > 0 && ENV["SHAINET_SPEC_STATS"]?
+        secs = (Time.instant - gen_started).total_seconds
+        STDERR.puts "  #{"spec: #{generated.size} tok in #{secs.round(1)} s = #{(generated.size / secs).round(1)} tok/s · #{steps} steps, #{(accepted.to_f / steps).round(2)} drafts kept per step (#{100 * accepted // Math.max(drafted, 1)}%)".colorize(:dark_gray)}"
+      end
       {@tokenizer.decode(generated).scrub, generated}
     end
 
@@ -2538,6 +2676,12 @@ STDERR.puts "Loading model from #{model_dir}...".colorize(:dark_gray)
 agent_context = (ENV["SHAINET_AGENT_CONTEXT"]? || "131072").to_i
 ENV["SHAINET_MAX_CONTEXT"] ||= agent_context.to_s
 ENV["SHAINET_KV_DTYPE"] ||= "q4"
+# Find the MTP draft head before loading, so the loader reserves VRAM for it.
+if gguf_mode && AgentDemo.spec_k > 0 && !ENV["SHAINET_MTP"]?
+  if sidecar = AgentDemo.find_mtp_sidecar(model_dir)
+    ENV["SHAINET_MTP"] = sidecar
+  end
+end
 # A 30B takes about nine minutes here. Without a progress line that is indistinguishable
 # from a hang, and the layer loop is where nearly all of it goes.
 load_started = Time.monotonic
@@ -2575,6 +2719,22 @@ has_moe = net.hidden_layers.any? { |l| l.is_a?(SHAInet::LlamaBlock) && l.as(SHAI
 mode = ENV["SHAINET_FP32"]? ? "fp32" : "Q#{bits}"
 mode += " (MoE offload)" if offload && has_moe
 STDERR.puts "Loaded in #{(Time.monotonic - t0).total_seconds.round(1)}s · #{mode} (vocab #{tokenizer.vocab.size})"
+
+# MTP speculative decoding. The draft head comes from SHAINET_MTP, a matching mtp-*.gguf under
+# ~/models (found above), or the model file itself.
+if gguf_mode && AgentDemo.spec_k > 0
+  mtp_src = ENV["SHAINET_MTP"]? || model_dir
+  if File.file?(mtp_src)
+    if head = SHAInet::HFLoader.load_gguf_mtp(mtp_src, agent_context)
+      net.mtp = head
+      STDERR.puts "MTP draft head from #{File.basename(mtp_src)} · #{AgentDemo.spec_k} draft tokens per step".colorize(:dark_gray)
+    elsif SHAInet::HFLoader.mtp_declined?
+      STDERR.puts "MTP draft head left out: no VRAM for it beside the full trunk (see the log above)".colorize(:yellow)
+    elsif ENV["SHAINET_MTP"]?
+      STDERR.puts "SHAINET_MTP=#{mtp_src} has no MTP block; decoding without speculation".colorize(:yellow)
+    end
+  end
+end
 
 # Size the expert cache to leave headroom for the model + prefill activations.
 # Only relevant for MoE models, where a fraction of experts are active per token and the rest

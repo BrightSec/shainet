@@ -932,7 +932,7 @@ module SHAInet
       # memory; applied to the tiled kernel they cut a 1024-token chunk to ~12 queries per call at 55K
       # of context -- against 64-query tiles -- and grew a 48 -> 97 MB buffer nothing read. attend_kv
       # sizes the workspace itself if a kernel declines and a workspace path runs after all.
-      tiled = n > 1 && use_tiled_prefill_attn? && head_dim % 16 == 0 && head_dim <= 256
+      tiled = n > GGUFMatrix::MULTIROW_MAX_ROWS && use_tiled_prefill_attn? && head_dim % 16 == 0 && head_dim <= 256
       max_chunk = tiled ? n : attn_chunk_tokens(total_len)
       # The split path's workspace scales with chunk * splits, so cap the chunk to keep it inside a
       # fixed budget. Without this the workspace grows with context and no reserve is ever enough.
@@ -1853,7 +1853,11 @@ module SHAInet
       # Multi-token chunks (prefill) take the tiled kernel: it reads each K/V row once per 16 queries
       # rather than once per query. It declines shapes it cannot serve, which falls through to the
       # paths below. Its output lands in @@gpu_attn_out like theirs; it does not use the workspace.
-      if n > 1 && use_tiled_prefill_attn?
+      #
+      # A few tokens (a speculative verify pass) go to the split path instead: the tiled kernel's
+      # 64-query tiles leave the card idle there, and 4 tokens at 32K context took 70 ms in it against
+      # 7 ms for one decode token.
+      if n > GGUFMatrix::MULTIROW_MAX_ROWS && use_tiled_prefill_attn?
         suffix = case kv_dtype
                  in .q4?  then "q4"
                  in .fp8? then "fp8"
