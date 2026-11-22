@@ -552,9 +552,7 @@ module AgentDemo
   # Named as a verb rather than as a `workspace=` setter on purpose: it validates and RAISES, and an
   # assignment that can reject its value reads as though it cannot.
   def self.switch_workspace!(path : String)
-    resolved = File.realpath(path)
-    raise ArgumentError.new("not a directory: #{path}") unless Dir.exists?(resolved)
-    @@workspace = resolved
+    @@workspace = WorkspacePath.resolve_root(path)
   end
 
   # Resolve a model-supplied path. Returns {path, ""} on success and {nil, error_text} on
@@ -1981,6 +1979,12 @@ module AgentDemo
       @cache_ids.clear
     end
 
+    # The single public entry for a cache reset, used after an unexpected error mid-turn: the KV cache
+    # may hold tokens @cache_ids does not, so the next turn prefills from scratch instead of trusting it.
+    def drop_cache!
+      reset_cache!
+    end
+
     # Prefill `prompt`, reusing whatever the KV cache already holds.
     #
     # This used to clear the cache and re-prefill the entire transcript on EVERY call, and
@@ -2834,77 +2838,89 @@ loop do
   input = input.strip
   next if input.empty?
 
-  case input
-  when "/help"
-    STDERR.puts "  /context  show context size, VRAM and cache usage".colorize(:dark_gray)
-    STDERR.puts "  /compact  summarize + trim the conversation history now".colorize(:dark_gray)
-    STDERR.puts "  /clear    reset the conversation".colorize(:dark_gray)
-    STDERR.puts "  /ask      revoke 'allow all' and confirm each tool call again".colorize(:dark_gray)
-    STDERR.puts "  /workspace  show the workspace root, or /workspace <dir> to change it".colorize(:dark_gray)
-    STDERR.puts "  /help     this message".colorize(:dark_gray)
-    next
-  when "/ask"
-    # The way back from answering "a". Without this, one keystroke silently approves every
-    # write and shell command for the rest of the session with no way to reconsider. It also
-    # forgets approved out-of-workspace locations, since those were granted by the same
-    # keystroke and leaving them behind would make the revocation only partly true.
-    outside = AgentDemo::WorkspacePath.approved_outside_count
-    if AgentDemo.allow_all? || outside > 0
-      AgentDemo.allow_all = false
-      AgentDemo::WorkspacePath.reset_outside_approvals!
-      note = outside > 0 ? " (also forgot #{outside} approved path(s) outside the workspace)" : ""
-      STDERR.puts "  will confirm each tool call again#{note}".colorize(:dark_gray)
-    else
-      STDERR.puts "  already confirming each tool call".colorize(:dark_gray)
-    end
-    next
-  when "/context"
-    STDERR.puts "  #{agent.status}".colorize(:dark_gray)
-    next
-  when "/compact"
-    # Forced: summarize everything but the most recent quarter of the transcript, whatever its size.
-    overhead = agent.overhead_tokens
-    target = Math.min(overhead + (agent.context_tokens - overhead) // 2, (agent.max_context * 0.75).to_i)
-    removed = agent.compact!(target, force: true)
-    STDERR.puts "  compacted −#{removed} tokens · #{agent.status}".colorize(:dark_gray)
-    next
-  when "/clear"
-    agent.reset
-    STDERR.puts "  conversation cleared".colorize(:dark_gray)
-    next
-  when "/workspace"
-    # No argument: show where the file tools are confined.
-    STDERR.puts "  workspace: #{AgentDemo.workspace}"
-    next
-  when /^\/workspace\s+(.+)$/
-    # Switch the sandbox root. The old root's outside approvals are forgotten with it: they
-    # were granted against a different sandbox, and keeping them would let the new workspace
-    # inherit permissions the user never asked for here.
-    arg = input[/^\/workspace\s+(.+)$/, 1].strip
-    begin
-      AgentDemo.switch_workspace!(arg)
-      outside = AgentDemo::WorkspacePath.approved_outside_count
-      AgentDemo::WorkspacePath.reset_outside_approvals!
-      note = outside > 0 ? " (forgot #{outside} approved path(s) outside the old workspace)" : ""
-      STDERR.puts "  workspace → #{AgentDemo.workspace}#{note}"
-    rescue ex : ArgumentError
-      STDERR.puts "  #{ex.message}"
-    end
-    next
-  else
-    # A mistyped command used to go to the MODEL as an ordinary prompt: "/cotext" spent a whole
-    # generation explaining that it does not know what /cotext means. Anything starting with a slash
-    # was meant for the program, so say it is unknown rather than charging a turn for the typo.
-    if input.starts_with?('/')
-      STDERR.puts "  unknown command #{input.split(' ').first} · try /help".colorize(:dark_gray)
+  begin
+    case input
+    when "/help"
+      STDERR.puts "  /context  show context size, VRAM and cache usage".colorize(:dark_gray)
+      STDERR.puts "  /compact  summarize + trim the conversation history now".colorize(:dark_gray)
+      STDERR.puts "  /clear    reset the conversation".colorize(:dark_gray)
+      STDERR.puts "  /ask      revoke 'allow all' and confirm each tool call again".colorize(:dark_gray)
+      STDERR.puts "  /workspace  show the workspace root, or /workspace <dir> to change it".colorize(:dark_gray)
+      STDERR.puts "  /help     this message".colorize(:dark_gray)
       next
+    when "/ask"
+      # The way back from answering "a". Without this, one keystroke silently approves every
+      # write and shell command for the rest of the session with no way to reconsider. It also
+      # forgets approved out-of-workspace locations, since those were granted by the same
+      # keystroke and leaving them behind would make the revocation only partly true.
+      outside = AgentDemo::WorkspacePath.approved_outside_count
+      if AgentDemo.allow_all? || outside > 0
+        AgentDemo.allow_all = false
+        AgentDemo::WorkspacePath.reset_outside_approvals!
+        note = outside > 0 ? " (also forgot #{outside} approved path(s) outside the workspace)" : ""
+        STDERR.puts "  will confirm each tool call again#{note}".colorize(:dark_gray)
+      else
+        STDERR.puts "  already confirming each tool call".colorize(:dark_gray)
+      end
+      next
+    when "/context"
+      STDERR.puts "  #{agent.status}".colorize(:dark_gray)
+      next
+    when "/compact"
+      # Forced: summarize everything but the most recent quarter of the transcript, whatever its size.
+      overhead = agent.overhead_tokens
+      target = Math.min(overhead + (agent.context_tokens - overhead) // 2, (agent.max_context * 0.75).to_i)
+      removed = agent.compact!(target, force: true)
+      STDERR.puts "  compacted −#{removed} tokens · #{agent.status}".colorize(:dark_gray)
+      next
+    when "/clear"
+      agent.reset
+      STDERR.puts "  conversation cleared".colorize(:dark_gray)
+      next
+    when "/workspace"
+      # No argument: show where the file tools are confined.
+      STDERR.puts "  workspace: #{AgentDemo.workspace}"
+      next
+    when /^\/workspace\s+(.+)$/
+      # Switch the sandbox root. The old root's outside approvals are forgotten with it: they
+      # were granted against a different sandbox, and keeping them would let the new workspace
+      # inherit permissions the user never asked for here.
+      arg = input[/^\/workspace\s+(.+)$/, 1].strip
+      begin
+        AgentDemo.switch_workspace!(arg)
+        outside = AgentDemo::WorkspacePath.approved_outside_count
+        AgentDemo::WorkspacePath.reset_outside_approvals!
+        note = outside > 0 ? " (forgot #{outside} approved path(s) outside the old workspace)" : ""
+        STDERR.puts "  workspace → #{AgentDemo.workspace}#{note}"
+      rescue ex : ArgumentError
+        STDERR.puts "  #{ex.message}"
+      end
+      next
+    else
+      # A mistyped command used to go to the MODEL as an ordinary prompt: "/cotext" spent a whole
+      # generation explaining that it does not know what /cotext means. Anything starting with a slash
+      # was meant for the program, so say it is unknown rather than charging a turn for the typo.
+      if input.starts_with?('/')
+        STDERR.puts "  unknown command #{input.split(' ').first} · try /help".colorize(:dark_gray)
+        next
+      end
     end
+  rescue ex
+    # A failing slash command (a bad path, a full disk) is reported, not fatal.
+    STDERR.puts "  #{input.split(' ').first} failed: #{ex.message}".colorize(:red)
+    next
   end
 
   AgentDemo.generating = true
   AgentDemo.steer_mode_on
   begin
     agent.chat(input)
+  rescue ex
+    # One failed turn must not end the session (and lose the conversation). Report it, drop the KV
+    # cache since it may be out of step with the transcript, and go back to the prompt.
+    STDERR.puts "\n  [agent] this turn failed: #{ex.class}: #{ex.message}".colorize(:red)
+    STDERR.puts "  the conversation is kept; the next turn re-prefills it".colorize(:dark_gray)
+    agent.drop_cache!
   ensure
     AgentDemo.steer_mode_off
     AgentDemo.generating = false

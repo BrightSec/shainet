@@ -238,3 +238,36 @@ describe "AgentDemo::WorkspacePath outside-workspace access" do
     AgentDemo::WorkspacePath.approved_outside?("/tmp/x").should be_false
   end
 end
+
+# /workspace <dir> resolves what the user typed. It once raised File::NotFoundError for a mistyped
+# path, which went uncaught and ended the whole agent session.
+describe "AgentDemo::WorkspacePath.resolve_root" do
+  it "expands a leading ~ to the home directory" do
+    AgentDemo::WorkspacePath.resolve_root("~").should eq(File.realpath(Path.home.to_s))
+    with_root do |root|
+      rel = root.lchop(File.realpath(Path.home.to_s))
+      next unless rel != root # tempdir not under $HOME on this machine
+      AgentDemo::WorkspacePath.resolve_root("~#{rel}").should eq(root)
+    end
+  end
+
+  it "raises ArgumentError, not File::Error, for a path that does not exist" do
+    expect_raises(ArgumentError, /no such directory/) do
+      AgentDemo::WorkspacePath.resolve_root("~/.kiro/crew/scra~/.kiro/crew/scratch/nope/")
+    end
+  end
+
+  it "raises ArgumentError for a file" do
+    with_root do |root|
+      expect_raises(ArgumentError, /not a directory/) do
+        AgentDemo::WorkspacePath.resolve_root(File.join(root, "keep.txt"))
+      end
+    end
+  end
+
+  it "canonicalizes an existing directory" do
+    with_root do |root|
+      AgentDemo::WorkspacePath.resolve_root(File.join(root, "sub", "..")).should eq(root)
+    end
+  end
+end
