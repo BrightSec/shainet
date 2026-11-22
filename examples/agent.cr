@@ -47,20 +47,19 @@ end
 module AgentDemo
   MAX_READ_BYTES = 64_000
 
-  # Tool-calling iterations allowed per user turn, before the agent hands control back.
+  # Optional cap on tool-calling rounds per user turn. Off by default: the system prompt tells the
+  # model there is no limit, and a fixed count contradicted that. A 40-round cap cut off a sub-agent
+  # doing real investigation (59K tokens of distinct greps and reads) mid-task, and the model only
+  # learned about the cap when it hit it.
   #
-  # A runaway guard, not a work budget: without it a model that keeps emitting tool calls
-  # never returns to the prompt. The number was 8, chosen when a turn's prefill cost minutes
-  # and a runaway was expensive. Prefill is now ~29 s at 4096 with KV prefix reuse making
-  # turn 2+ about a second, so 8 stopped being a runaway guard and started truncating
-  # ordinary work -- reading four files and grepping twice already exceeds it.
+  # Runaways are caught without a count: REPEAT_CALL_LIMIT stops repeated identical calls, the context
+  # window bounds a turn, and Ctrl-C or a typed line stops it from the terminal.
   #
-  # 40 is high enough that hitting it means something is actually looping.
-  # AGENT_MAX_TOOL_STEPS overrides it, clamped to at least 1: a 0 would break out before
-  # generating anything and every turn would answer with silence.
+  # AGENT_MAX_TOOL_STEPS=N sets a cap. The model is then told about it in the system prompt and sees
+  # the rounds left on every tool result, so it can plan instead of being cut off.
   MAX_TOOL_STEPS = begin
-    n = (ENV["AGENT_MAX_TOOL_STEPS"]? || "40").to_i
-    n < 1 ? 1 : n
+    n = ENV["AGENT_MAX_TOOL_STEPS"]?.try(&.to_i?)
+    n && n > 0 ? n : nil
   end
 
   # How many times an IDENTICAL tool call is allowed before the loop intervenes, and how many recent
@@ -2287,27 +2286,19 @@ module AgentDemo
         # A cancel during a tool step must also end the LOOP, not just the token stream it was in --
         # otherwise the decoder returns early and the loop calmly starts the next step.
         break if AgentDemo.cancelled?
-        # The LAST allowed step still generates, it just may not call tools. Breaking before
-        # generation (which is what this did) threw the turn away: the user got the cap
-        # message and no answer, after the agent had already done the work. So tell the model
-        # its budget is gone and let it write a closing reply from what it has.
-        last_step = step >= MAX_TOOL_STEPS
-        if step > MAX_TOOL_STEPS
-          break
-        end
-        if last_step
-          STDERR.puts "  [agent] loop guard reached (#{MAX_TOOL_STEPS} tool rounds); asking for a final answer".colorize(:dark_gray)
-          STDERR.puts "  (raise it with AGENT_MAX_TOOL_STEPS)".colorize(:dark_gray)
-          # Worded as a one-off loop guard, scoped to this request. It stays in the history (removing
-          # it would break the KV prefix and force a full re-prefill of the conversation), and the
-          # earlier "you have used all N tool steps for this turn" taught the model that every later
-          # turn ran under a tool-call budget.
+        # With a cap set (AGENT_MAX_TOOL_STEPS), the LAST allowed step still generates, it just may
+        # not call tools, so the turn ends with an answer rather than the cap message alone. The
+        # model has seen the rounds left on every tool result, so this is not a surprise to it.
+        cap = MAX_TOOL_STEPS
+        last_step = !cap.nil? && step >= cap
+        break if cap && step > cap
+        if cap && last_step
+          STDERR.puts "  [agent] tool-round cap reached (#{cap}, AGENT_MAX_TOOL_STEPS); asking for a final answer".colorize(:dark_gray)
+          # It stays in the history: removing it would break the KV prefix and force a full re-prefill.
           @messages << Message.new("user",
-            "[agent harness, not the user] This request has gone through #{MAX_TOOL_STEPS} tool " \
-            "rounds, which usually means a loop, so the harness is stopping it. Do not call any " \
-            "more tools in this reply: answer with what you have and say plainly what is " \
-            "unfinished. This applies to this request only. The next user message starts fresh, " \
-            "and normal work has no tool-call limit.")
+            "[agent harness, not the user] This request has used all #{cap} tool rounds set by " \
+            "AGENT_MAX_TOOL_STEPS. Do not call any more tools in this reply: answer with what you " \
+            "have and say plainly what is unfinished. The next user message gets a fresh #{cap} rounds.")
         end
 
         # Keep the prompt AND its reply within the context budget. Compacting only once the prompt
@@ -2471,7 +2462,11 @@ module AgentDemo
           # output held a stray 0x80 byte killed the whole agent with "Regex match error". Scrubbed
           # once here, where untrusted text enters the conversation.
           result = result.scrub
-          @messages << Message.new("tool", clamp_tool_result(result))
+          result = clamp_tool_result(result)
+          if cap = MAX_TOOL_STEPS
+            result = "#{result}\n[tool round #{step} of #{cap}; #{cap - step} left for this request]"
+          end
+          @messages << Message.new("tool", result)
           STDERR.puts "    #{AgentDemo.summarize_result(result).colorize(:dark_gray)}"
         end
       end
@@ -2577,8 +2572,14 @@ module AgentDemo
       s << "approach after one failure.\n\n"
 
       s << "# Using tools\n"
-      s << "- There is no limit on tool calls. Use as many as the task needs, and keep going until "
-      s << "the request is fully resolved or you hit a blocker you can name.\n"
+      if cap = MAX_TOOL_STEPS
+        s << "- Each request may use at most #{cap} tool rounds (one round is one reply with tool calls). "
+        s << "Every tool result says how many are left; plan to finish, or to report what is "
+        s << "unfinished, within them.\n"
+      else
+        s << "- There is no limit on tool calls. Use as many as the task needs, and keep going until "
+        s << "the request is fully resolved or you hit a blocker you can name.\n"
+      end
       s << "- Calls that do not depend on each other can go in the same reply.\n"
       if names.includes?("run_command")
         s << "- Prefer the dedicated tools to run_command: read_file instead of cat/head/tail, "
