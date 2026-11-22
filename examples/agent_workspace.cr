@@ -28,6 +28,20 @@ module AgentDemo
   end
 
   module WorkspacePath
+    # A user-typed directory for /workspace, canonicalized. No shell is involved, so a leading ~ is
+    # expanded here (File.realpath alone looks for a directory named "~"). Raises ArgumentError,
+    # never File::Error, so the REPL reports a bad path instead of dying on it.
+    def self.resolve_root(path : String) : String
+      expanded = path == "~" || path.starts_with?("~/") ? File.join(Path.home.to_s, path.lchop("~")) : path
+      resolved = begin
+        File.realpath(expanded)
+      rescue File::Error
+        raise ArgumentError.new("no such directory: #{path}")
+      end
+      raise ArgumentError.new("not a directory: #{path}") unless Dir.exists?(resolved)
+      resolved
+    end
+
     extend self
 
     def resolve(root : String, relative : String) : String
