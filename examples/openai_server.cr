@@ -130,14 +130,20 @@ module OpenAIServer
     # "auto", "none", "required", or {type: "function", function: {name: ...}}.
     getter tool_choice : JSON::Any?
 
-    # The function name a client is forcing, if any.
+    # The function name a client is forcing, if any. tool_choice is usually a STRING ("auto", "none",
+    # "required"); indexing it as an object raised and answered every such request with a 500.
+    # Parsed by the same helper as the Responses API.
     def forced_tool : String?
-      tc = @tool_choice
-      return unless tc
-      tc["function"]?.try(&.["name"]?).try(&.as_s?)
+      OpenAIResponses.tool_choice(@tool_choice)[1]
+    end
+
+    # tool_choice "none": the tools are not offered to the model at all.
+    def tools_disabled? : Bool
+      OpenAIResponses.tool_choice(@tool_choice)[0]
     end
 
     def tool_defs : Array(ToolProtocol::FunctionDef)
+      return [] of ToolProtocol::FunctionDef if tools_disabled?
       (@tools || [] of ToolDef).map do |t|
         ToolProtocol::FunctionDef.new(t.function.name, t.function.description, t.function.parameters)
       end
@@ -1307,6 +1313,18 @@ server = HTTP::Server.new do |ctx|
       res.status = HTTP::Status::NOT_FOUND
       res.content_type = "application/json"
       res.print OpenAIServer.error_json("Unknown route: #{req.method} #{req.path}", "not_found")
+    end
+  rescue ex
+    # An unexpected error answers THIS request with a JSON 500 naming the cause, and is logged with
+    # its backtrace here. Left to HTTP::Server it became a bare 500 the client could not explain, and
+    # the access line below still said 200.
+    OpenAIServer::Log.error(exception: ex) { "#{peer} #{req.method} #{req.path} failed: #{ex.message}" }
+    begin
+      res.status = HTTP::Status::INTERNAL_SERVER_ERROR
+      res.content_type = "application/json"
+      res.print OpenAIServer.error_json("Internal error: #{ex.message}", "server_error")
+    rescue IO::Error
+      # A streaming response already sent its headers; the stream just ends.
     end
   ensure
     # One line per request, on EVERY exit path -- which is why it is an ensure rather than a call at the
