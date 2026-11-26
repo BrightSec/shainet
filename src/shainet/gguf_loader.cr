@@ -2,6 +2,28 @@ require "./gguf"
 
 module SHAInet
   module HFLoader
+    # An MTP sidecar for `model` (a GGUF without its own MTP block): a `mtp-*.gguf` under `dir`
+    # (default ~/models/*/) whose architecture, width and depth match the model's, e.g. unsloth's
+    # MTP/mtp-Qwen3.8-27B-Q4_0.gguf. Nil when there is none or the model carries its own head.
+    def self.find_mtp_sidecar(model : String, glob : String = File.join(Path.home, "models", "*", "mtp-*.gguf")) : String?
+      meta = ->(path : String) do
+        gf = GGUF::File.open(path)
+        arch = gf.meta_string("general.architecture") || ""
+        {arch, gf.meta_u32("#{arch}.embedding_length"), gf.meta_u32("#{arch}.block_count"),
+         gf.meta_u32("#{arch}.nextn_predict_layers") || 0_u32}
+      end
+      arch, width, depth, nextn = meta.call(model)
+      return if nextn > 0
+      Dir.glob(glob).sort.find do |cand|
+        a, w, dd, n = meta.call(cand)
+        a == arch && w == width && n > 0 && (d0 = depth) && dd == d0 + n
+      rescue
+        false
+      end
+    rescue
+      nil
+    end
+
     # Set by load_gguf when the VRAM budget had no room for an MTP head beside a fully resident trunk;
     # load_gguf_mtp then returns nil.
     @@mtp_declined = false
