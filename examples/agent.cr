@@ -1170,22 +1170,7 @@ module AgentDemo
   # whose architecture, width and depth match the model's, e.g. unsloth's
   # MTP/mtp-Qwen3.8-27B-Q4_0.gguf saved to ~/models/<any>/. Nil when there is none.
   def self.find_mtp_sidecar(model : String) : String?
-    meta = ->(path : String) do
-      gf = SHAInet::GGUF::File.open(path)
-      arch = gf.meta_string("general.architecture") || ""
-      {arch, gf.meta_u32("#{arch}.embedding_length"), gf.meta_u32("#{arch}.block_count"),
-       gf.meta_u32("#{arch}.nextn_predict_layers") || 0_u32}
-    end
-    arch, width, depth, nextn = meta.call(model)
-    return if nextn > 0 # the model carries its own head
-    Dir.glob(File.join(Path.home, "models", "*", "mtp-*.gguf")).sort.find do |cand|
-      a, w, dd, n = meta.call(cand)
-      a == arch && w == width && n > 0 && (d0 = depth) && dd == d0 + n
-    rescue
-      false
-    end
-  rescue
-    nil
+    SHAInet::HFLoader.find_mtp_sidecar(model)
   end
 
   def self.cancel!

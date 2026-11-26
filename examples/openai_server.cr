@@ -2,6 +2,7 @@ require "../src/shainet"
 require "./tool_protocol"
 require "./openai_responses"
 require "./qwen_thinking"
+require "./spec_accept"
 require "http/server"
 require "json"
 require "random/secure"
@@ -407,28 +408,14 @@ module OpenAIServer
         emitted = 0
         finish = "length"
 
-        # The limit counts reasoning, as OpenAI's max_completion_tokens and max_output_tokens do. A
-        # reply whose reasoning used the whole limit ends with finish_reason "length" (Responses:
-        # status "incomplete"), which is what OpenAI returns and what clients already handle.
-        while generated.size < limit
-          # Let other fibers run.
-          #
-          # Crystal's HTTP server is fiber-based, and this loop is CPU/GPU bound with no yield point of
-          # its own. Without this the WHOLE server is frozen for the duration of a generation -- not
-          # just this request: the accept loop stops, health checks time out, and a streaming response
-          # cannot flush. At roughly 85 ms per token a 500-token answer is 42 seconds of a server that
-          # looks dead to everything else. A streaming request gets away with it by accident, because
-          # writing each chunk is I/O and yields; a non-streaming one does no I/O per token at all.
-          #
-          # Same root cause as the agent's Ctrl-C handler never firing: a tight Crystal loop starves
-          # every other fiber, including the ones the runtime needs.
-          Fiber.yield
-          last = logits.rows - 1
-          sampler.apply_presence_frequency!(logits, counts, sampling.presence, sampling.frequency, row: last)
-          id = sampler.sample(logits, last)
-          break if id < 0 || @stop_ids.includes?(id) ? (finish = "stop"; true) : false
-          break unless logits[last, id].finite?
-
+        # Take one sampled token: false when generation must stop (a stop token, a stop string, or the
+        # limit reached). Shared by the plain and the speculative loop so both stream, cut and count the
+        # same way.
+        accept = ->(id : Int32) : Bool do
+          if id < 0 || @stop_ids.includes?(id)
+            finish = "stop"
+            return false
+          end
           generated << id
           counts[id] = (counts[id]? || 0) + 1
           text += @tok.decode([id])
@@ -443,8 +430,9 @@ module OpenAIServer
             piece = text.byte_slice(emitted, si - emitted).scrub
             block.call(piece) unless piece.empty?
             text = text.byte_slice(0, si)
+            emitted = text.bytesize
             finish = "stop"
-            break
+            return false
           end
 
           piece = text.byte_slice(emitted)
@@ -452,8 +440,38 @@ module OpenAIServer
             block.call(piece) unless piece.empty?
             emitted = text.bytesize
           end
+          generated.size < limit
+        end
 
-          logits = @net.run([id], stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
+        # The limit counts reasoning, as OpenAI's max_completion_tokens and max_output_tokens do. A
+        # reply whose reasoning used the whole limit ends with finish_reason "length" (Responses:
+        # status "incomplete"), which is what OpenAI returns and what clients already handle.
+        if @net.mtp && @spec_k > 0
+          spec = speculate(logits, sampler, sampling, counts, limit, accept)
+          Log.info do
+            "spec: #{spec[0]} steps, #{(spec[1].to_f / Math.max(spec[0], 1)).round(2)} drafts kept " \
+            "per step (#{100 * spec[1] // Math.max(spec[2], 1)}%)"
+          end
+        else
+          while generated.size < limit
+            # Let other fibers run.
+            #
+            # Crystal's HTTP server is fiber-based, and this loop is CPU/GPU bound with no yield point
+            # of its own. Without this the WHOLE server is frozen for the duration of a generation --
+            # not just this request: the accept loop stops, health checks time out, and a streaming
+            # response cannot flush. At roughly 85 ms per token a 500-token answer is 42 seconds of a
+            # server that looks dead to everything else.
+            #
+            # Same root cause as the agent's Ctrl-C handler never firing: a tight Crystal loop starves
+            # every other fiber, including the ones the runtime needs.
+            Fiber.yield
+            last = logits.rows - 1
+            sampler.apply_presence_frequency!(logits, counts, sampling.presence, sampling.frequency, row: last)
+            id = sampler.sample(logits, last)
+            break if id >= 0 && !logits[last, id].finite?
+            break unless accept.call(id)
+            logits = @net.run([id], stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
+          end
         end
         # A character still incomplete when generation stopped: send what there is, scrubbed.
         if emitted < text.bytesize
@@ -534,6 +552,66 @@ module OpenAIServer
       @saved_prompt = nil
       @net.drop_saved_cache!
       @net.clear_cache!
+    end
+
+    # Draft tokens per speculative step when the network has an MTP head; 0 decodes one at a time.
+    property spec_k : Int32 = 0
+
+    # MTP speculative decoding, the agent's loop (Agent#generate_from_spec): per step the head drafts
+    # spec_k tokens after the one just sampled, the trunk runs them all in one verify pass, and drafts
+    # are kept while the trunk's own sample at each row equals them. A draft is therefore kept with
+    # exactly the trunk's probability for it, so the output follows the client's sampling settings.
+    # Presence/frequency penalties are applied per row from counts that include the drafts already
+    # kept in this step, as one-at-a-time decoding would see them.
+    #
+    # `accept` takes each token in order and returns false to stop. Returns {steps, drafts kept,
+    # drafts proposed}.
+    private def speculate(logits : SHAInet::SimpleMatrix, sampler : SHAInet::Sampler, sampling : Sampling,
+                          counts : Hash(Int32, Int32), limit : Int32,
+                          accept : Proc(Int32, Bool)) : {Int32, Int32, Int32}
+      steps = kept = proposed = 0
+      last = logits.rows - 1
+      sampler.apply_presence_frequency!(logits, counts, sampling.presence, sampling.frequency, row: last)
+      x = sampler.sample(logits, last)
+      return {0, 0, 0} if x >= 0 && !logits[last, x].finite?
+      produced = 0
+      loop do
+        Fiber.yield # keep the server responsive, as in the plain loop
+        break unless accept.call(x)
+        produced += 1
+        kk = Math.min(@spec_k, limit - produced)
+        kk = Math.min(kk, @max_context - 1 - @net.cached_positions - 1)
+        if kk <= 0
+          rows = @net.run([x], stealth: true, return_matrix: true).as(SHAInet::SimpleMatrix)
+          r = rows.rows - 1
+          sampler.apply_presence_frequency!(rows, counts, sampling.presence, sampling.frequency, row: r)
+          x = sampler.sample(rows, r)
+          break if x >= 0 && !rows[r, x].finite?
+          next
+        end
+
+        base = @net.cached_positions
+        drafts = @net.mtp_draft(x, kk)
+        toks = [x] + drafts
+        rows = @net.verify(toks)
+        sample_row = ->(r : Int32) : Int32 do
+          sampler.apply_presence_frequency!(rows, counts, sampling.presence, sampling.frequency, row: r)
+          s = sampler.sample(rows, r)
+          s >= 0 && !rows[r, s].finite? ? OpenAIServer::NONFINITE : s
+        end
+        a, y, outcome = OpenAIServer.accept_drafts(drafts, sample_row, accept)
+        produced += a
+        stopped = outcome != OpenAIServer::DraftOutcome::Continue
+        # Always commit, even when stopping: it clears the verify pass's pending rows and leaves the
+        # cache holding exactly the tokens fed (the next request rewinds to its saved prompt anyway).
+        @net.commit_verify!(base, toks, a + 1)
+        steps += 1
+        proposed += kk
+        kept += a
+        break if stopped
+        x = y
+      end
+      {steps, kept, proposed}
     end
 
     # Byte offset of the earliest stop sequence in `text`, or nil.
@@ -835,7 +913,27 @@ server_context = (ENV["SHAINET_SERVER_CONTEXT"]? || ENV["SHAINET_MAX_CONTEXT"]? 
 ENV["SHAINET_MAX_CONTEXT"] = server_context.to_s
 STDERR.puts "  Context: #{server_context} tok (KV reserved for this at load)"
 
+# MTP speculative decoding, as in the agent: the draft head comes from SHAINET_MTP, a matching
+# mtp-*.gguf under ~/models, or the model file itself. Found BEFORE loading so the loader reserves
+# VRAM for it (it drops the head rather than push trunk layers to the CPU). SHAINET_SPEC_K sets the
+# draft tokens per step (default 3); 0 turns speculation off.
+spec_k = (ENV["SHAINET_SPEC_K"]?.try(&.to_i?) || 3).clamp(0, 7)
+if gguf_mode && spec_k > 0 && !ENV["SHAINET_MTP"]?
+  if sidecar = SHAInet::HFLoader.find_mtp_sidecar(model_dir)
+    ENV["SHAINET_MTP"] = sidecar
+  end
+end
+
 net = SHAInet::HFLoader.load(model_dir, quantize: quantize, bits: bits)
+if gguf_mode && spec_k > 0
+  mtp_src = ENV["SHAINET_MTP"]? || model_dir
+  if File.file?(mtp_src) && (head = SHAInet::HFLoader.load_gguf_mtp(mtp_src, server_context))
+    net.mtp = head
+    STDERR.puts "  MTP draft head from #{File.basename(mtp_src)}, #{spec_k} draft tokens per step"
+  elsif SHAInet::HFLoader.mtp_declined?
+    STDERR.puts "  MTP draft head left out: no VRAM for it beside the full trunk"
+  end
+end
 # A GGUF carries its own tokenizer; there is no tokenizer.json beside it. Reading one unconditionally
 # is what turned "this format is not supported here" into a missing-file error about the wrong file.
 tokenizer =
@@ -875,6 +973,7 @@ if (n = ollama_name) && n.includes?("/")
   model_ids << n.split("/").last
 end
 engine = OpenAIServer::Engine.new(net, tokenizer, model_name, server_context)
+engine.spec_k = spec_k
 
 api_key = ENV["SHAINET_API_KEY"]?
 # Token limit for a request that sends none. Unset by default, as on OpenAI: generation may then use
