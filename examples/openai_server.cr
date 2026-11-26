@@ -3,6 +3,7 @@ require "./tool_protocol"
 require "./openai_responses"
 require "./qwen_thinking"
 require "./spec_accept"
+require "./openai_chat_stream"
 require "http/server"
 require "json"
 require "random/secure"
@@ -111,6 +112,13 @@ module OpenAIServer
     getter model : String?
     getter messages : Array(ChatMessage)
     getter? stream : Bool = false
+    # {"include_usage": true} asks for a final chunk carrying token usage.
+    getter stream_options : JSON::Any?
+
+    def include_usage? : Bool
+      @stream_options.try { |o| o.as_h? ? o["include_usage"]?.try(&.as_bool?) : nil } || false
+    end
+
     getter temperature : Float64?
     getter top_p : Float64?
     # OpenAI deprecated max_tokens for max_completion_tokens; both are accepted, the new name first.
@@ -679,40 +687,6 @@ module OpenAIServer
     "chatcmpl-#{Random::Secure.hex(12)}"
   end
 
-  # Separate the model's private reasoning from its answer. Returns {reasoning, answer}.
-  #
-  # Every OpenAI-compatible server that handles reasoning models agrees on the invariant: `content`
-  # carries the conclusion only. They differ on the reasoning, and none of them throw it away -- DeepSeek
-  # returns it as `reasoning_content` "at the same level as content", vLLM the same and now migrating to
-  # `reasoning`, Anthropic as a separate thinking block, and OpenAI's own reasoning models withhold the
-  # text but still bill it in usage. An earlier version of this code deleted it, which kept content
-  # correct and made the server useless to a client that wants to display or log the chain of thought.
-  #
-  # An unterminated block -- generation stopped mid-thought -- yields all reasoning and no answer, which
-  # is what actually happened: there is no conclusion to report, and inventing one from the scratchpad
-  # would be worse than an empty answer.
-  def split_reasoning(text : String) : Tuple(String, String)
-    reasoning = [] of String
-    text.scan(/<think>(.*?)<\/think>/m) { |m| reasoning << m[1].strip }
-    answer = text.gsub(/<think>.*?<\/think>/m, "")
-    if i = answer.index("<think>")
-      reasoning << answer[(i + "<think>".size)..].strip
-      answer = answer[0, i]
-    end
-    # Tool-call markup is not prose and must not travel as content.
-    #
-    # The calls are parsed from the raw text separately and returned as a structured tool_calls array, so
-    # leaving the XML in here would send it TWICE -- once structured and once as text a client would
-    # display to its user and echo back on the next turn. Same failure as the <think> leak, one layer
-    # down. An unterminated opener is dropped along with everything after it, since a half-written call
-    # is not something a caller can use either.
-    answer = answer.gsub(/<tool_call>.*?<\/tool_call>/m, "")
-    if i = answer.index("<tool_call>")
-      answer = answer[0, i]
-    end
-    {reasoning.reject(&.empty?).join("\n\n"), answer.strip}
-  end
-
   def chat_completion_json(id : String, model : String, gen : Generation) : String
     JSON.build do |j|
       j.object do
@@ -795,7 +769,64 @@ module OpenAIServer
   # `finish_reason` is nil for content chunks and set on the final chunk.
   def chunk_json(id : String, model : String, created : Int64,
                  delta_role : String? = nil, delta_content : String? = nil,
-                 finish_reason : String? = nil) : String
+                 finish_reason : String? = nil, delta_reasoning : String? = nil) : String
+    chunk(id, model, created, finish_reason) do |j|
+      j.field "role", delta_role if delta_role
+      # Both names, as in the whole response (see chat_completion_json).
+      if r = delta_reasoning
+        j.field "reasoning_content", r
+        j.field "reasoning", r
+      end
+      j.field "content", delta_content if delta_content
+    end
+  end
+
+  # The parsed tool calls as one delta, in OpenAI's streaming shape: each call carries its index,
+  # id, type, name and the complete arguments string.
+  def tool_calls_chunk_json(id : String, model : String, created : Int64, gen : Generation) : String
+    chunk(id, model, created, nil) do |j|
+      j.field "tool_calls" do
+        j.array do
+          gen.calls.each_with_index do |c, i|
+            definition = gen.tool_defs.find { |d| d.name == c.name }
+            j.object do
+              j.field "index", i
+              j.field "id", c.id
+              j.field "type", "function"
+              j.field "function" do
+                j.object do
+                  j.field "name", c.name
+                  j.field "arguments", ToolProtocol.arguments_json(c, definition)
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # stream_options.include_usage: a final chunk with empty choices and the token counts.
+  def usage_chunk_json(id : String, model : String, created : Int64, gen : Generation) : String
+    JSON.build do |j|
+      j.object do
+        j.field "id", id
+        j.field "object", "chat.completion.chunk"
+        j.field "created", created
+        j.field "model", model
+        j.field("choices") { j.array { } }
+        j.field "usage" do
+          j.object do
+            j.field "prompt_tokens", gen.prompt_tokens
+            j.field "completion_tokens", gen.completion_tokens
+            j.field "total_tokens", gen.prompt_tokens + gen.completion_tokens
+          end
+        end
+      end
+    end
+  end
+
+  private def chunk(id : String, model : String, created : Int64, finish_reason : String?, &)
     JSON.build do |j|
       j.object do
         j.field "id", id
@@ -806,12 +837,7 @@ module OpenAIServer
           j.array do
             j.object do
               j.field "index", 0
-              j.field "delta" do
-                j.object do
-                  j.field "role", delta_role if delta_role
-                  j.field "content", delta_content if delta_content
-                end
-              end
+              j.field("delta") { j.object { yield j } }
               j.field "finish_reason", finish_reason
             end
           end
@@ -1104,11 +1130,28 @@ server = HTTP::Server.new do |ctx|
         }
         send.call(OpenAIServer.chunk_json(id, model, created, delta_role: "assistant"))
 
+        # The raw stream carries <think> and <tool_call> markup. It was sent as content, so a client
+        # showed the model's reasoning and the call XML to its user and never got tool_calls at all.
+        # Split it as the non-streaming response does: reasoning goes out as reasoning_content /
+        # reasoning deltas, the visible answer as content, and the parsed calls in one tool_calls chunk
+        # at the end. A tag split across tokens is held back until it resolves (AnswerStream).
+        streams = OpenAIServer::ChatStream.new
+        send_deltas = ->(d : {String, String}) do
+          r, c = d
+          return if r.empty? && c.empty?
+          send.call(OpenAIServer.chunk_json(id, model, created, delta_content: c.empty? ? nil : c,
+            delta_reasoning: r.empty? ? nil : r))
+        end
         gen = engine.generate(request.messages, max_tokens, sampling, think, stops, request.seed, request.tool_defs, request.forced_tool) do |piece|
-          send.call(OpenAIServer.chunk_json(id, model, created, delta_content: piece))
+          send_deltas.call(streams.feed(piece))
+        end
+        send_deltas.call(streams.finish(gen.reasoning, gen.text))
+        unless gen.calls.empty?
+          send.call(OpenAIServer.tool_calls_chunk_json(id, model, created, gen))
         end
 
         send.call(OpenAIServer.chunk_json(id, model, created, finish_reason: gen.finish_reason))
+        send.call(OpenAIServer.usage_chunk_json(id, model, created, gen)) if request.include_usage?
         res.print "data: [DONE]\n\n"
         res.flush
       else
