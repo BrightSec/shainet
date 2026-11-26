@@ -290,6 +290,11 @@ module OpenAIServer
       bos, start_hdr, end_hdr, eot = @bos, @start_hdr, @end_hdr, @eot
       rendered = render_messages(messages, tools, forced_tool, mode)
 
+      # Client text is untrusted bytes: JSON.parse accepts a string with invalid UTF-8 (a tool result
+      # from a binary, a truncated multi-byte character), and the tokenizer's regex pre-split raises on
+      # it, failing the whole request. The agent scrubs tool output at the same boundary.
+      rendered = rendered.map { |role, head, content| {role, head, content.scrub} }
+
       if im_start && im_end
         rendered.each do |role, head, content|
           ids << im_start
