@@ -93,6 +93,14 @@ describe OpenAIResponses do
       OpenAIResponses.tool_choice(j(%("auto"))).should eq({false, nil})
       OpenAIResponses.tool_choice(j(%({"type": "function", "name": "a"}))).should eq({false, "a"})
     end
+
+    # Chat completions parses tool_choice with this helper too. Its own parser indexed every
+    # tool_choice as an object, so the common string form raised and the request got a 500.
+    it "reads the chat-completions forms" do
+      OpenAIResponses.tool_choice(j(%("required"))).should eq({false, nil})
+      OpenAIResponses.tool_choice(j(%({"type": "function", "function": {"name": "b"}}))).should eq({false, "b"})
+      OpenAIResponses.tool_choice(nil).should eq({false, nil})
+    end
   end
 
   describe ".format_instruction / .with_system / .strip_code_fence" do
